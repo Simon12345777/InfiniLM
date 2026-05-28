@@ -194,12 +194,11 @@ class LLMEngine:
                     req.mark_canceled()
                 continue
 
-            if req.is_prefill:
+            if is_prefill:
                 # Clean up chunked-prefill state on the final chunk so the
                 # next forward pass on this request takes the decode path.
                 req.chunk_prefill_offset = 0
                 req.chunk_size = 0
-                req.is_prefill = False
 
             req.generated_token_ids.append(token_id)
             pending_tokens = req.generated_token_ids[req._token_decode_offset :]

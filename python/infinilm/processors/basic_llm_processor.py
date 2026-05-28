@@ -276,7 +276,7 @@ class BasicLLMProcessor(InfinilmProcessor):
         # guarantee non-empty tokens and slot_mapping to avoid downstream errors. If empty, raise with detailed debug info.
         if not tokens or not slot_mapping:
             states = [
-                (r.request_id[:8], r.is_prefill, r.is_chunking(),
+                (r.request_id[:8], r.is_chunking(),
                 r.chunk_prefill_offset, r.prompt_length, r.num_local_cached_tokens,
                 len(r.slot_mapping), r.status.name)
                 for r in scheduler_output.scheduled_requests

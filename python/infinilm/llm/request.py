@@ -213,7 +213,6 @@ class InferenceRequest:
         """Return True if this request is in the middle of chunked-prefill."""
         return (
             self.chunk_size > 0
-            and self.is_prefill
             and (self.prompt_length - self.num_local_cached_tokens) > self.chunk_size
         )
 

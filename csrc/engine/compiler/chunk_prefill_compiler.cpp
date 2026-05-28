@@ -3,13 +3,6 @@
 #include "infinicore/context/context.hpp"
 
 
-namespace {
-inline void set_zeros(infinicore::Tensor &tensor) {
-    std::vector<uint8_t> zeros(tensor->nbytes(), 0);
-    infinicore::context::memcpyH2D(tensor->data(), zeros.data(), tensor->nbytes(), false);
-}
-} // namespace
-
 namespace infinilm::engine {
 
 ChunkPrefillCompiler::ChunkPrefillCompiler(const std::shared_ptr<InfinilmModel> &model, RankBarrier *barrier)
@@ -52,9 +45,8 @@ void ChunkPrefillCompiler::compile() {
         // Pre-allocate a shared block_tables_holder for the largest (batch_size) we'll use
         size_t max_batch = *std::max_element(prefill_batch_sizes_.begin(), prefill_batch_sizes_.end());
         size_t block_per_req = nblocks / max_batch;
-        block_tables_holder_ = infinicore::Tensor::empty(
+        block_tables_holder_ = infinicore::Tensor::zeros(
             {nblocks}, infinicore::DataType::I32, infinicore::context::getDevice());
-        set_zeros(block_tables_holder_);
 
         for (size_t b : prefill_batch_sizes_) {
             for (size_t cs : chunk_sizes_) {
@@ -68,14 +60,12 @@ void ChunkPrefillCompiler::compile() {
                 InfinilmModel::Input input;
 
                 // input_ids: [1, total_tokens] — all tokens for this batch packed together
-                input.input_ids = infinicore::Tensor::empty(
+                input.input_ids = infinicore::Tensor::zeros(
                     {1, total_tokens}, infinicore::DataType::I64, infinicore::context::getDevice());
-                set_zeros(input.input_ids.value());
 
                 // position_ids: [total_tokens]
-                input.position_ids = infinicore::Tensor::empty(
+                input.position_ids = infinicore::Tensor::zeros(
                     {total_tokens}, infinicore::DataType::I64, infinicore::context::getDevice());
-                set_zeros(input.position_ids.value());
 
                 // total_sequence_lengths: [b], set to cs (first-chunk scenario)
                 input.total_sequence_lengths = infinicore::Tensor::empty(
@@ -118,9 +108,8 @@ void ChunkPrefillCompiler::compile() {
                     {b, bpr}, {(ptrdiff_t)bpr, 1});
 
                 // slot_mapping: [total_tokens]
-                input.slot_mapping = infinicore::Tensor::empty(
+                input.slot_mapping = infinicore::Tensor::zeros(
                     {total_tokens}, infinicore::DataType::I64, infinicore::context::getDevice());
-                set_zeros(input.slot_mapping.value());
 
                 // Attention reads attn_metadata from thread-local forward context.
                 infinilm::global_state::get_forward_context().attn_metadata = {

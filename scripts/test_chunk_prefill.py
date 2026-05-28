@@ -42,7 +42,7 @@ def wait_for_server(popen, host, port, model, timeout=300):
 
 def inference_server(chunk_size, device, port, batch_size, max_new_tokens, enable_paged_attn, enable_graph, model_path):
     print(INFERENCE_SERVER)
-    args = ["CUDA_VISIBLE_DEVICES=11", sys.executable, INFERENCE_SERVER,
+    args = ["CUDA_VISIBLE_DEVICES=8", sys.executable, INFERENCE_SERVER,
             f"--chunk-size {chunk_size}",
             f"--device {device}",
             f"--port {port}",
