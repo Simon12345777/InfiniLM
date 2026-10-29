@@ -209,6 +209,8 @@ class InferenceRequest:
             0  # Number of cached tokens visible to the current model step
         )
         self.num_computed_tokens: int = 0  # Total tokens computed (local + remote)
+        # Exclusive prompt boundary for the current chunk; None on decode.
+        self.prefill_chunk_end: Optional[int] = None
         self.num_blocks: int = 0
         # Incremental hashes for complete logical token blocks.
         self._block_hashes: List[BlockHash] = []

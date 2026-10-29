@@ -107,6 +107,10 @@ class LLMEngine:
         self._async_abort_owner = False
         hf_config = read_hf_config(config.model_path)
         has_mamba_cache = model_uses_mamba_cache(hf_config)
+        if config.enable_chunked_prefill and (
+            has_mamba_cache or hf_config.get("model_type") == "videonsa"
+        ):
+            raise ValueError("chunked prefill does not support recurrent or NSA caches")
         if has_mamba_cache and config.enable_prefix_caching:
             model_type = hf_config["model_type"]
             raise RuntimeError(
@@ -128,6 +132,17 @@ class LLMEngine:
 
         # Initialize processor
         self.processor = self.model_runner.processor
+        if config.enable_chunked_prefill and (
+            not isinstance(self.processor, BasicLLMProcessor)
+            or type(self.processor).build_model_inputs
+            is not BasicLLMProcessor.build_model_inputs
+            or type(self.processor)._build_model_input_from_batch_scheduler_output
+            is not BasicLLMProcessor._build_model_input_from_batch_scheduler_output
+        ):
+            self.model_runner.close()
+            raise ValueError(
+                "chunked prefill requires the standard text paged-input processor"
+            )
         self.tokenizer = self.processor.get_tokenizer()
 
         # Initialize KV cache based on cache type
@@ -163,16 +178,26 @@ class LLMEngine:
             )
             num_mamba_cache_blocks = max(2, config.num_blocks // 4)
 
-            max_num_batched_tokens = int(
-                os.getenv("INFINILM_MAX_NUM_BATCHED_TOKENS", max_position_embeddings)
-            )
-            assert 1024 <= max_num_batched_tokens <= max_position_embeddings
+            max_num_batched_tokens = config.max_num_batched_tokens
+            if max_num_batched_tokens is None:
+                max_num_batched_tokens = int(
+                    os.getenv(
+                        "INFINILM_MAX_NUM_BATCHED_TOKENS",
+                        max_position_embeddings,
+                    )
+                )
+            if not 1 <= max_num_batched_tokens <= max_position_embeddings:
+                raise ValueError(
+                    "max_num_batched_tokens must be within the model context length"
+                )
 
             self.scheduler = Scheduler(
                 max_batch_size=config.max_batch_size,
                 num_blocks=config.num_blocks,
                 block_size=config.block_size,
                 max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                prefill_chunk_size=config.prefill_chunk_size,
                 connector=connector,
                 has_mamba_cache=has_mamba_cache,
                 num_mamba_cache_blocks=num_mamba_cache_blocks,
@@ -334,7 +359,12 @@ class LLMEngine:
         for req, token_ids in zip(requests, sampled_token_ids):
             # The model successfully consumed the request's current logical tokens.
             # Commit this boundary before observing a concurrent client abort.
-            pre_output_computed_tokens = req.get_total_length()
+            pre_output_computed_tokens = (
+                req.prefill_chunk_end
+                if req.prefill_chunk_end is not None
+                else req.get_total_length()
+            )
+            req.num_computed_tokens = pre_output_computed_tokens
             self.scheduler.commit_computed_tokens(req, pre_output_computed_tokens)
 
             if req.is_aborted():
@@ -343,6 +373,10 @@ class LLMEngine:
                 )
                 if not self._async_abort_owner:
                     _finalize_aborted_request(req, FinishReason.CANCELED)
+                continue
+
+            if pre_output_computed_tokens < req.get_prompt_length():
+                # Intermediate logits do not represent a generated token.
                 continue
 
             if isinstance(token_ids, (list, tuple)):
@@ -509,6 +543,10 @@ class LLM:
         skip_load: bool = False,
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
+        enable_chunked_prefill: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
+        prefill_chunk_size: int = 1024,
+        enable_chunk_prefill_graph: bool = False,
     ):
         """Initialize LLM.
 
@@ -528,6 +566,7 @@ class LLM:
             top_p: Default top-p sampling parameter.
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
+            enable_chunk_prefill_graph: Independently enable full prefill chunk graphs.
             attn_backend: Attention backend to use ('default', 'flash-attn').
             use_mla: Whether to use DeepSeek V2 MLA attention when supported.
             weight_load_mode: Weight loading mode across tensor-parallel workers.
@@ -548,6 +587,10 @@ class LLM:
             cache_type=cache_type,
             max_batch_size=max_batch_size,
             static_cache_capacity=static_cache_capacity,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size,
+            enable_chunk_prefill_graph=enable_chunk_prefill_graph,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
@@ -736,6 +779,10 @@ class AsyncLLMEngine:
         weight_load_mode: str = "async",
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
+        enable_chunked_prefill: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
+        prefill_chunk_size: int = 1024,
+        enable_chunk_prefill_graph: bool = False,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -755,6 +802,7 @@ class AsyncLLMEngine:
             top_p: Default top-p sampling parameter.
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
+            enable_chunk_prefill_graph: Independently enable full prefill chunk graphs.
             attn_backend: Attention backend to use ('default', 'flash-attn').
             kv_connector: KV connector type ('MooncakeConnector').
             kv_role: Role in KV connector ('kv_producer' or 'kv_consumer').
@@ -779,6 +827,10 @@ class AsyncLLMEngine:
             cache_type=cache_type,
             max_batch_size=max_batch_size,
             static_cache_capacity=static_cache_capacity,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_batched_tokens=max_num_batched_tokens,
+            prefill_chunk_size=prefill_chunk_size,
+            enable_chunk_prefill_graph=enable_chunk_prefill_graph,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,

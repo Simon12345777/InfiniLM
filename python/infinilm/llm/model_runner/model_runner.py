@@ -82,6 +82,8 @@ class ModelRunner:
                 num_blocks=config.num_blocks,
                 block_size=config.block_size,
                 max_batch_size=config.max_batch_size,
+                prefill_chunk_size=config.prefill_chunk_size,
+                enable_chunk_prefill_graph=config.enable_chunk_prefill_graph,
             )
             logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
         else:
@@ -296,7 +298,13 @@ class ModelRunner:
             for request in requests
         ]
         model_input["random_values"] = [
-            request.next_sampling_random_value() for request in requests
+            (
+                0.0
+                if request.prefill_chunk_end is not None
+                and request.prefill_chunk_end < request.get_prompt_length()
+                else request.next_sampling_random_value()
+            )
+            for request in requests
         ]
 
         # Wake every stage before stage 0 enters forward. Each worker receives

@@ -73,8 +73,12 @@ class BaseConfig:
 
         self.attn = self.args.attn
         self.enable_graph = self.args.enable_graph
+        self.enable_chunk_prefill_graph = self.args.enable_chunk_prefill_graph
         self.enable_paged_attn = self.args.enable_paged_attn
         self.enable_prefix_caching = self.args.enable_prefix_caching
+        self.enable_chunked_prefill = self.args.enable_chunked_prefill
+        self.max_num_batched_tokens = self.args.max_num_batched_tokens
+        self.prefill_chunk_size = self.args.prefill_chunk_size
         self.use_mla = self.args.use_mla
         self.pre_transpose = self.args.pre_transpose
         self.num_blocks = self.args.num_blocks
@@ -224,6 +228,11 @@ class BaseConfig:
         )
         self.parser.add_argument("--enable-graph", action="store_true")
         self.parser.add_argument(
+            "--enable-chunk-prefill-graph",
+            action="store_true",
+            help="record and replay full prefill chunks independently of decode graphs",
+        )
+        self.parser.add_argument(
             "--pre-transpose",
             action="store_true",
             help="enable one-time weight pre-transposition for packed GEMM",
@@ -237,6 +246,23 @@ class BaseConfig:
             "--enable-paged-attn",
             action="store_true",
             help="use paged cache",
+        )
+        self.parser.add_argument(
+            "--enable-chunked-prefill",
+            action="store_true",
+            help="split text prefill into bounded paged-attention batches",
+        )
+        self.parser.add_argument(
+            "--prefill-chunk-size",
+            type=int,
+            default=1024,
+            help="maximum tokens per prefill chunk (independent of batch token budget)",
+        )
+        self.parser.add_argument(
+            "--max-num-batched-tokens",
+            type=int,
+            default=None,
+            help="maximum tokens per batch (strict with chunked prefill)",
         )
         self.parser.add_argument(
             "--disable-prefix-caching",

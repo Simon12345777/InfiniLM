@@ -189,7 +189,22 @@ class Scheduler:
         num_mamba_cache_blocks: int | None = None,
         enable_prefix_caching: bool = True,
         nsa_owner_pool_epoch: int | None = None,
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 1024,
     ):
+        if type(prefill_chunk_size) is not int or prefill_chunk_size < 1:
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        self.prefill_chunk_size = prefill_chunk_size
+        if max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if enable_chunked_prefill and (
+            connector is not None or has_mamba_cache or nsa_owner_pool_epoch is not None
+        ):
+            raise ValueError(
+                "chunked prefill requires standard paged attention without KV transfer"
+            )
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self._prefer_decode = False
         if nsa_owner_pool_epoch is not None and (
             connector is not None or has_mamba_cache
         ):
@@ -239,6 +254,10 @@ class Scheduler:
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
+            if self.enable_chunked_prefill and (
+                request.has_multimodal_inputs or request.get_prompt_length() == 0
+            ):
+                raise ValueError("chunked prefill requires a non-empty text prompt")
             if self._completion_failed:
                 raise RuntimeError(
                     "paged scheduler cannot accept after a failed completion"
@@ -384,6 +403,8 @@ class Scheduler:
     def schedule(self) -> Optional[SchedulerOutput]:
         """Schedule and return batch of requests to execute."""
         self._ensure_scheduler_thread()
+        if self.enable_chunked_prefill:
+            return self._schedule_chunked()
         if self._nsa_owner_clock is not None and self._nsa_pending_handoff is not None:
             raise RuntimeError(
                 "NSA previous managed batch must be consumed before another schedule"
@@ -678,6 +699,108 @@ class Scheduler:
 
         return None
 
+    def _schedule_chunked(self) -> Optional[SchedulerOutput]:
+        """Alternate bounded prefill and decode batches, retaining prompt pages.
+
+        Reserve the full prompt on admission and decode headroom for every live
+        request, so an admitted partial prefill cannot deadlock on allocation.
+        Only successfully executed chunks publish their prefix-cache boundary.
+        """
+        decode = not self.running_queue.sync_q.empty() and (
+            self._prefer_decode or self.waiting_queue.sync_q.empty()
+        )
+        work_queue = self.running_queue.sync_q if decode else self.waiting_queue.sync_q
+        scheduled = []
+        seen = set()
+        budget = self.max_num_batched_tokens
+        for _ in range(work_queue.qsize()):
+            if len(scheduled) >= self.max_batch_size or budget == 0:
+                break
+            req = work_queue.get_nowait()
+            self._dequeued_request = req
+            if id(req) in seen:
+                self._completion_failed = True
+                raise RuntimeError("paged request appeared twice in one schedule")
+            seen.add(id(req))
+            self._claim_request(req)
+            self._dequeued_request = None
+            if req.is_finished() or req.is_aborted():
+                if not req.is_finished():
+                    req.mark_canceled()
+                self.complete_requests([req])
+                continue
+            if decode:
+                req.prefill_chunk_end = None
+                req.block_table, slot = self.cache_manager.append_slot(
+                    req.block_table, req.get_total_length()
+                )
+                req.num_blocks = len(req.block_table)
+                req.slot_mapping = [slot]
+                req.num_local_cached_tokens = req.get_total_length() - 1
+                count = 1
+            else:
+                if not req.block_table:
+                    cached, start = (
+                        self.cache_manager.get_computed_blocks(
+                            req.block_hashes, req.get_prompt_length() - 1
+                        )
+                        if self.enable_prefix_caching
+                        else ([], 0)
+                    )
+                    reserved = sum(
+                        self._get_prefill_extra_blocks(other)
+                        for other in self._active_requests.values()
+                        if other is not req and other.block_table
+                    )
+                    required = (
+                        req.get_prompt_length() - start + self.block_size - 1
+                    ) // self.block_size
+                    headroom = (
+                        req.sampling_params.max_tokens + self.block_size - 1
+                    ) // self.block_size
+                    if (
+                        required + headroom + reserved
+                        > self.cache_manager.get_total_usable_blocks()
+                    ):
+                        self.cache_manager.free_blocks(cached)
+                        work_queue.put(req)
+                        continue
+                    allocation = self.cache_manager.allocate_slots(
+                        req.get_prompt_length() - start,
+                        num_computed_tokens=start,
+                        cached_block_table=cached,
+                    )
+                    if allocation is None:
+                        self.cache_manager.free_blocks(cached)
+                        work_queue.put(req)
+                        continue
+                    req.block_table, _ = allocation
+                    req.num_blocks = len(req.block_table)
+                    req.num_computed_tokens = start
+                    req.num_cache_indexed_blocks = len(cached)
+                start = req.num_computed_tokens
+                count = min(
+                    self.prefill_chunk_size, budget, req.get_prompt_length() - start
+                )
+                req.num_local_cached_tokens = start
+                req.prefill_chunk_end = start + count
+                req.slot_mapping = self.cache_manager.update_blocks_slot(
+                    req.block_table, start, req.prefill_chunk_end
+                )
+            budget -= count
+            req.status = RequestStatus.RUNNING
+            scheduled.append(req)
+        self._prefer_decode = not decode
+        if not scheduled and not decode and not self.running_queue.sync_q.empty():
+            return self._schedule_chunked()
+        if not scheduled:
+            return None
+        return SchedulerOutput(
+            scheduled,
+            is_prefill=not decode,
+            speculative_cache_ops=self.speculative_cache_ops,
+        )
+
     def update_waiting_for_remote_kv(self, request: InferenceRequest):
         self.remote_kv_requests.pop(request.request_id, None)
         self.pending_kv_decode_blocks -= (
@@ -772,7 +895,13 @@ class Scheduler:
                     )
             else:
                 # Still running, put back in running queue
-                self.running_queue.sync_q.put(req)
+                if (
+                    self.enable_chunked_prefill
+                    and req.num_computed_tokens < req.get_prompt_length()
+                ):
+                    self.waiting_queue.sync_q.put(req)
+                else:
+                    self.running_queue.sync_q.put(req)
 
     def notify_failed_requests(self, finalize_request) -> None:
         """Notify after async fail-stop without retiring resource ownership."""

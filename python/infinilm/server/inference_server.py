@@ -125,6 +125,10 @@ class InferenceServer:
         kv_transfer_config: Optional[KVTransferConfig] = None,
         enable_prefix_caching: bool = True,
         pre_transpose: bool = False,
+        enable_chunked_prefill: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
+        prefill_chunk_size: int = 1024,
+        enable_chunk_prefill_graph: bool = False,
     ):
         """Initialize inference server.
 
@@ -147,6 +151,7 @@ class InferenceServer:
             host: Server host address.
             port: Server port number.
             enable_graph: Whether to enable graph compiling.
+            enable_chunk_prefill_graph: Independently enable full prefill chunk graphs.
             attn_backend: Attention backend to use ('default', 'flash-attn').
             use_mla: Whether to use DeepSeek V2 MLA attention when supported.
             skip_load: Whether to skip loading model weights.
@@ -178,6 +183,7 @@ class InferenceServer:
         self.host = host
         self.port = port
         self.enable_graph = enable_graph
+        self.enable_chunk_prefill_graph = enable_chunk_prefill_graph
         self.attn_backend = attn_backend
         self.use_mla = use_mla
         self.skip_load = skip_load
@@ -185,6 +191,9 @@ class InferenceServer:
         self.ignore_eos = ignore_eos
         self.kv_transfer_config = kv_transfer_config
         self.enable_prefix_caching = enable_prefix_caching
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.prefill_chunk_size = prefill_chunk_size
         self.pre_transpose = pre_transpose
 
         self.engine: AsyncLLMEngine = None
@@ -222,17 +231,24 @@ class InferenceServer:
                 top_p=self.top_p,
                 top_k=self.top_k,
                 enable_graph=self.enable_graph,
+                enable_chunk_prefill_graph=self.enable_chunk_prefill_graph,
                 attn_backend=self.attn_backend,
                 use_mla=self.use_mla,
                 skip_load=self.skip_load,
                 weight_load_mode=self.weight_load_mode,
                 kv_transfer_config=self.kv_transfer_config,
                 enable_prefix_caching=self.enable_prefix_caching,
+                enable_chunked_prefill=self.enable_chunked_prefill,
+                prefill_chunk_size=self.prefill_chunk_size,
+                max_num_batched_tokens=self.max_num_batched_tokens,
                 pre_transpose=self.pre_transpose,
             )
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
             logger.info(f"  enable_graph: {self.enable_graph}")
+            logger.info(
+                f"  enable_chunk_prefill_graph: {self.enable_chunk_prefill_graph}"
+            )
             yield
             self.engine.stop()
 
@@ -640,6 +656,7 @@ def main():
         host=cfg.host,
         port=cfg.port,
         enable_graph=cfg.enable_graph,
+        enable_chunk_prefill_graph=cfg.enable_chunk_prefill_graph,
         attn_backend=cfg.attn,
         use_mla=cfg.use_mla,
         skip_load=cfg.skip_load,
@@ -647,6 +664,9 @@ def main():
         ignore_eos=cfg.ignore_eos,
         kv_transfer_config=kv_transfer_config,
         enable_prefix_caching=cfg.enable_prefix_caching,
+        enable_chunked_prefill=cfg.enable_chunked_prefill,
+        prefill_chunk_size=cfg.prefill_chunk_size,
+        max_num_batched_tokens=cfg.max_num_batched_tokens,
         pre_transpose=cfg.pre_transpose,
     )
     server.start()

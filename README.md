@@ -1,5 +1,73 @@
 # InfiniLM
 
+### Chunked prefill
+
+Text models using the standard paged-attention processor can split long prompts
+across scheduling steps. Enable it on the inference server with:
+
+```bash
+python python/infinilm/server/inference_server.py --model=/path/to/model \
+  --enable-paged-attn --enable-chunked-prefill --prefill-chunk-size=512 \
+  --max-num-batched-tokens=2048
+```
+
+For the Python API, pass `enable_chunked_prefill=True` and
+`prefill_chunk_size=512` to `LLM(...)` or `EngineConfig(...)`.
+`prefill_chunk_size` stores the chunk size independently and defaults to 1024.
+`max_num_batched_tokens` controls only the batch-wide token budget; the explicit
+budget takes precedence over `INFINILM_MAX_NUM_BATCHED_TOKENS`, with the model
+context length used as the default regardless of whether chunking is enabled.
+The actual chunk length is the minimum of `prefill_chunk_size`, the remaining
+batch budget, and the remaining prompt tokens. For example, a 2048-token batch
+budget can accommodate four 512-token chunks from four requests.
+Chunked prefill is disabled by default.
+
+To prepare and replay fixed-size prefill graphs, additionally pass
+`--enable-chunk-prefill-graph` (Python: `enable_chunk_prefill_graph=True`).
+It requires `--enable-chunked-prefill` and is independent of `--enable-graph`:
+
+| `--enable-graph` | `--enable-chunk-prefill-graph` | Paged graph paths |
+| --- | --- | --- |
+| off | off | None |
+| on | off | Decode only |
+| off | on | Full prefill chunks only |
+| on | on | Decode and full prefill chunks |
+
+For example, to enable only chunk prefill graphs:
+
+```bash
+python python/infinilm/server/inference_server.py --model=/path/to/model \
+  --enable-paged-attn --enable-chunked-prefill --prefill-chunk-size=512 \
+  --enable-chunk-prefill-graph
+```
+
+The native paged compiler records full `prefill_chunk_size` chunks after weights
+are loaded, for the supported batch-size buckets that fit the KV pool. Each
+request in a matching batch must contribute exactly one complete chunk. Replay
+updates token IDs, positions, past/total lengths, cumulative lengths, page tables
+and write slots in persistent device buffers. Short tails and mixed chunk sizes
+fall back to eager. One-token inputs use the existing decode-shaped graphs only
+when `--enable-graph` is enabled; chunk prefill graph plans require a chunk size > 1.
+This path requires ordinary unquantized KV caches, a single pipeline stage and
+the paged/Flash Attention backend. Capture increases startup time and graph
+memory usage. Rebuild the native extension after updating this code.
+
+`forward_raw(..., sample_all_positions=False)` exposes `execution_report`:
+`device_graph_segments > 0` confirms device replay; `host_replay` alone does not
+demonstrate reduced GPU kernel-launch overhead. Performance improvement must be
+measured on the target hardware and workload.
+
+Each prefill batch stays within the token budget. Prefill and decode batches
+alternate when both have work; they are separate model forwards. Intermediate
+chunks update KV state and publish only completed prefix blocks, without emitting
+tokens or advancing the request's sampling RNG. The last chunk produces the first
+output token. Prompt pages are reserved in full at admission, with decode
+headroom retained; this feature bounds computation per step, not total KV memory.
+
+The initial implementation supports standard text paged attention. Static cache,
+multimodal input, recurrent/Mamba and NSA caches, speculative decoding, and KV
+transfer are rejected when chunking is enabled.
+
 ![star](https://atomgit.com/InfiniTensor/InfiniLM/star/badge.svg)
 
 本项目是基于 [`InfiniCore`](https://github.com/InfiniTensor/InfiniCore) 的推理引擎。

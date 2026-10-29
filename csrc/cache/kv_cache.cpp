@@ -150,10 +150,17 @@ infinilm::runtime::Tensor create_layer_kv_cache(
 PagedKVCacheConfig::PagedKVCacheConfig(
     size_t num_blocks,
     size_t block_size,
-    size_t max_batch_size)
+    size_t max_batch_size,
+    size_t prefill_chunk_size,
+    bool enable_chunk_prefill_graph)
     : num_blocks_(num_blocks),
       block_size_(block_size),
-      max_batch_size_(max_batch_size) {
+      max_batch_size_(max_batch_size),
+      prefill_chunk_size_(prefill_chunk_size),
+      enable_chunk_prefill_graph_(enable_chunk_prefill_graph) {
+    if (enable_chunk_prefill_graph_ && prefill_chunk_size_ == 0) {
+        throw std::invalid_argument("chunk prefill graphs require a positive prefill_chunk_size");
+    }
 }
 
 std::unique_ptr<CacheConfig>

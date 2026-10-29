@@ -84,6 +84,13 @@ RankWorker::RankWorker(
     thread_ = std::thread(&RankWorker::thread_loop, this);
 }
 
+bool RankWorker::graph_compiling_enabled() const {
+    const auto *paged_config = dynamic_cast<const cache::PagedKVCacheConfig *>(
+        model_->get_cache_config());
+    return enable_graph_compiling_
+        || (paged_config && paged_config->enable_chunk_prefill_graph());
+}
+
 void RankWorker::refresh_finite_paged_decode_profile() {
     finite_paged_decode_profile_.reset();
     const auto *paged_config = dynamic_cast<const cache::PagedKVCacheConfig *>(
@@ -569,7 +576,7 @@ void RankWorker::thread_loop() {
                 runtime_->syncStream();
             }
             refresh_finite_paged_decode_profile();
-            if (enable_graph_compiling_ && rank_info_.pp_size == 1) {
+            if (graph_compiling_enabled() && rank_info_.pp_size == 1) {
                 PagedGraphConfig{attention_backend_, rank_info_.tp_size, rank_info_.tp_rank, rank_info_.pp_size}.validate();
             }
 
@@ -833,13 +840,13 @@ void RankWorker::thread_loop() {
                                 forward_context_.nsa_owner = proof;
                                 model_->prepare_paged_owner(forward_context_); // all layers BEFORE any input/device/raw write
                             }
-                            const char *eager_reason = !enable_graph_compiling_        ? "graphs_disabled"
+                            const char *eager_reason = !graph_compiling_enabled()      ? "graphs_disabled"
                                                      : rank_info_.pp_size != 1         ? "pipeline_graph_not_supported"
                                                      : local_args.sample_all_positions ? "all_positions_not_compiled"
                                                                                        : "no_matching_plan";
-                            // Packed all-position runs do not match the one-token-per-request
-                            // output shape captured by the compiled decode graphs.
-                            if (!local_args.sample_all_positions && enable_graph_compiling_ && rank_info_.pp_size == 1) {
+                            // Both graph families return one output per request.
+                            // PagedCompiler independently admits decode and chunk prefill.
+                            if (!local_args.sample_all_positions && graph_compiling_enabled() && rank_info_.pp_size == 1) {
                                 GraphCompiler::Compiled compiled{nullptr, nullptr};
                                 {
                                     const auto lookup_input = effective_args.to_model_input(
@@ -1106,7 +1113,7 @@ void RankWorker::thread_loop() {
                     model_->reset_cache(local_cache_config != nullptr ? local_cache_config.get() : nullptr,
                                         forward_context_, attention_backend_, rank_info_);
                     refresh_finite_paged_decode_profile();
-                    if (enable_graph_compiling_ && rank_info_.pp_size == 1) {
+                    if (graph_compiling_enabled() && rank_info_.pp_size == 1) {
                         PagedGraphConfig{attention_backend_, rank_info_.tp_size, rank_info_.tp_rank, rank_info_.pp_size}.validate();
                     }
                     {
@@ -1138,14 +1145,15 @@ void RankWorker::thread_loop() {
                     if (nsa_pool_epoch_) {
                         throw std::invalid_argument("NSA COMPILE rejected before compiler/cache touch");
                     }
-                    if (enable_graph_compiling_ && rank_info_.pp_size == 1) {
+                    if (graph_compiling_enabled() && rank_info_.pp_size == 1) {
                         compiler_.reset();
                         if (dynamic_cast<const cache::StaticKVCacheConfig *>(model_->get_cache_config())) {
                             compiler_ = std::make_unique<StaticBatchingCompiler>(model_, barrier_, *runtime_, forward_context_);
                         } else if (dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())) {
                             compiler_ = std::make_unique<PagedCompiler>(
                                 model_, barrier_, *runtime_, forward_context_,
-                                PagedGraphConfig{attention_backend_, rank_info_.tp_size, rank_info_.tp_rank, rank_info_.pp_size});
+                                PagedGraphConfig{attention_backend_, rank_info_.tp_size, rank_info_.tp_rank, rank_info_.pp_size,
+                                                 enable_graph_compiling_});
                         }
                         if (compiler_) {
                             compiler_->compile();

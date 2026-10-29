@@ -176,6 +176,7 @@ private:
     void submit_w4_phase(Command command);
     void fail(const char *operation, std::exception_ptr error) noexcept;
     void refresh_finite_paged_decode_profile();
+    bool graph_compiling_enabled() const;
     bool drain_nsa_owner_noexcept() noexcept;
 
 private:

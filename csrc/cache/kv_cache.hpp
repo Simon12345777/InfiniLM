@@ -55,17 +55,23 @@ public:
     PagedKVCacheConfig(
         size_t num_blocks,
         size_t block_size = 256,
-        size_t max_batch_size = 1);
+        size_t max_batch_size = 1,
+        size_t prefill_chunk_size = 1024,
+        bool enable_chunk_prefill_graph = false);
 
     std::unique_ptr<CacheConfig> unique_copy() const override;
     size_t num_blocks() const;
     size_t block_size() const;
     size_t max_batch_size() const;
+    size_t prefill_chunk_size() const { return prefill_chunk_size_; }
+    bool enable_chunk_prefill_graph() const { return enable_chunk_prefill_graph_; }
 
 private:
     size_t num_blocks_;
     size_t block_size_;
     size_t max_batch_size_;
+    size_t prefill_chunk_size_;
+    bool enable_chunk_prefill_graph_;
 };
 
 namespace PagedKVCache {

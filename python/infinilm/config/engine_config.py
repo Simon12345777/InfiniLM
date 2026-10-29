@@ -29,6 +29,10 @@ class EngineConfig:
         block_size: Size of each KV cache block (only for paged cache).
         max_cache_len: Maximum sequence length (only for static cache).
         enable_prefix_caching: Whether to reuse KV cache across requests.
+        enable_chunked_prefill: Split text prefill into bounded paged batches.
+        prefill_chunk_size: Maximum tokens in one prefill chunk (default 1024).
+        enable_chunk_prefill_graph: Record/replay chunk prefill graphs independently of enable_graph.
+        max_num_batched_tokens: Per-step token budget; None uses the environment/default.
         temperature: Default sampling temperature.
         top_p: Default top-p sampling parameter.
         top_k: Default top-k sampling parameter.
@@ -69,8 +73,31 @@ class EngineConfig:
     kv_transfer_config: Optional[KVTransferConfig] = None
     enable_prefix_caching: bool = True
     static_cache_capacity: int = 1
+    enable_chunked_prefill: bool = False
+    max_num_batched_tokens: Optional[int] = None
+    prefill_chunk_size: int = 1024
+    enable_chunk_prefill_graph: bool = False
 
     def __post_init__(self) -> None:
+        if self.enable_chunk_prefill_graph and not self.enable_chunked_prefill:
+            raise ValueError(
+                "enable_chunk_prefill_graph requires enable_chunked_prefill"
+            )
+        if type(self.prefill_chunk_size) is not int or self.prefill_chunk_size < 1:
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        if self.max_num_batched_tokens is not None and (
+            type(self.max_num_batched_tokens) is not int
+            or self.max_num_batched_tokens < 1
+        ):
+            raise ValueError("max_num_batched_tokens must be a positive integer")
+        if self.enable_chunked_prefill and (
+            self.cache_type != "paged"
+            or self.draft_model_path is not None
+            or (self.kv_transfer_config and self.kv_transfer_config.kv_connector)
+        ):
+            raise ValueError(
+                "chunked prefill requires paged cache without speculative decoding or KV transfer"
+            )
         if (
             type(self.static_cache_capacity) is not int
             or self.static_cache_capacity < 1

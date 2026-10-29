@@ -2,6 +2,7 @@
 #include "../../utils.hpp"
 #include "paged_decode_bucket.hpp"
 #include "paged_prepare_inputs.hpp"
+#include "paged_prefill_match.hpp"
 #include "prepare_state_guard.hpp"
 #include "runtime/utils.hpp"
 
@@ -149,6 +150,7 @@ void PagedCompiler::compile() {
     if (paged_config != nullptr) {
         compiled_short_decode_b1_.reset();
         compiled_map_decode_.clear();
+        compiled_map_prefill_.clear();
         block_tables_holder_.reset();
         short_block_tables_holder_.reset();
 
@@ -181,11 +183,37 @@ void PagedCompiler::compile() {
             || nblocks > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / max_batch_size) {
             throw std::invalid_argument("paged prepare block table size overflows");
         }
+        const size_t chunk = paged_config->prefill_chunk_size();
+        const size_t page_size = paged_config->block_size();
+        std::vector<size_t> prefill_batches;
+        size_t prepare_blocks = graph_config_.enable_decode_graph ? max_batch_size : 0;
+        if (paged_config->enable_chunk_prefill_graph()
+            && chunk > 1 && page_size > 0 && position_id_axes == 1
+            && graph_config_.pp_size == 1 && model_config
+            && model_config->get_kv_quant_scheme() == quantization::KVQuantAlgo::NONE
+            && (graph_config_.attention_backend == backends::AttentionBackend::FLASH_ATTN
+                || graph_config_.attention_backend == backends::AttentionBackend::PAGED_ATTN)
+            && nblocks <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) / page_size
+            && chunk <= nblocks * page_size) {
+            const size_t pages = 1 + (chunk - 1) / page_size;
+            for (size_t b : decode_batch_sizes_) {
+                if (b <= nblocks / pages
+                    && b <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) / chunk) {
+                    prefill_batches.push_back(b);
+                    prepare_blocks = std::max(prepare_blocks, b * pages);
+                }
+            }
+        }
+        if (prepare_blocks == 0) {
+            return;
+        }
         auto write_views = paged_prepare_views(
-            runtime_, forward_context, nblocks, paged_config->block_size(), max_batch_size, 1);
+            runtime_, forward_context, nblocks, page_size, prepare_blocks,
+            prefill_batches.empty() ? 1 : page_size);
         PrepareStateGuard prepare_state{runtime_, forward_context, std::move(write_views)};
         decltype(compiled_map_decode_) candidate_decode;
         decltype(compiled_short_decode_b1_) candidate_short_decode;
+        decltype(compiled_map_prefill_) candidate_prefill;
         infinilm::runtime::Tensor candidate_short_holder;
         auto candidate_holder = infinilm::runtime::Tensor::empty(
             runtime_, {nblocks * max_batch_size}, infinilm::runtime::DataType::kInt32);
@@ -280,16 +308,18 @@ void PagedCompiler::compile() {
             }
         };
 
-        for (size_t b : decode_batch_sizes_) {
-            candidate_decode.emplace(
-                std::make_pair(b, size_t{0}),
-                capture_decode(b, nblocks, candidate_holder, 0));
+        if (graph_config_.enable_decode_graph) {
+            for (size_t b : decode_batch_sizes_) {
+                candidate_decode.emplace(
+                    std::make_pair(b, size_t{0}),
+                    capture_decode(b, nblocks, candidate_holder, 0));
+            }
         }
 
         const auto finite_profile = make_finite_paged_decode_profile(
             *paged_config, model_config.get(), model_->supports_kv_only_prepare(),
             runtime_.device().type(), graph_config_);
-        if (supports_finite_paged_decode_bucket(finite_profile)) {
+        if (graph_config_.enable_decode_graph && supports_finite_paged_decode_bucket(finite_profile)) {
             for (size_t b : {size_t{1}, size_t{2}}) {
                 if (b > max_batch_size) {
                     continue;
@@ -303,7 +333,7 @@ void PagedCompiler::compile() {
             }
         }
 
-        if (uses_short_decode_graph(
+        if (graph_config_.enable_decode_graph && uses_short_decode_graph(
                 *paged_config, model_->get_model_config().get(),
                 runtime_.device().type(), graph_config_)) {
             candidate_short_holder = infinilm::runtime::Tensor::empty(
@@ -317,11 +347,72 @@ void PagedCompiler::compile() {
                 0));
         }
 
+        for (size_t b : prefill_batches) {
+            auto input = make_decode_input(b, nblocks, candidate_holder, 0);
+            const size_t tokens = b * chunk;
+            const size_t pages = 1 + (chunk - 1) / page_size;
+            using infinilm::runtime::Tensor;
+            using infinilm::runtime::DataType;
+            auto upload = [&](const auto &values, DataType dtype, std::vector<size_t> shape) {
+                auto tensor = Tensor::empty(runtime_, shape, dtype);
+                runtime_.memcpyH2D(tensor->data(), values.data(), tensor->nbytes(), false);
+                return tensor;
+            };
+            std::vector<int64_t> ids(tokens, 0), positions(tokens), slots(tokens);
+            std::vector<int32_t> offsets(b + 1), totals(b, static_cast<int32_t>(chunk)), past(b, 0);
+            std::vector<int32_t> table(b * nblocks, -1);
+            for (size_t row = 0; row < b; ++row) {
+                offsets[row] = static_cast<int32_t>(row * chunk);
+                for (size_t page = 0; page < pages; ++page) {
+                    table[row * nblocks + page] = static_cast<int32_t>(row * pages + page);
+                }
+                for (size_t token = 0; token < chunk; ++token) {
+                    positions[row * chunk + token] = static_cast<int64_t>(token);
+                    slots[row * chunk + token] = static_cast<int64_t>(row * pages * page_size + token);
+                }
+            }
+            offsets[b] = static_cast<int32_t>(tokens);
+            input.input_ids = upload(ids, DataType::kInt64, {1, tokens});
+            input.position_ids = upload(positions, DataType::kInt64, {tokens});
+            input.slot_mapping = upload(slots, DataType::kInt64, {tokens});
+            input.past_sequence_lengths = upload(past, DataType::kInt32, {b});
+            input.total_sequence_lengths = upload(totals, DataType::kInt32, {b});
+            input.input_offsets = upload(offsets, DataType::kInt32, {b + 1});
+            input.cu_seqlens = upload(offsets, DataType::kInt32, {b + 1});
+            runtime_.memcpyH2D(input.block_tables.value()->data(), table.data(), table.size() * sizeof(int32_t), false);
+            forward_context.attn_metadata = {
+                input.past_sequence_lengths, input.total_sequence_lengths,
+                input.input_offsets, input.cu_seqlens, input.block_tables, input.slot_mapping};
+            // Capture static upper bounds, but keep actual lengths in mutable
+            // device tensors. Never freeze a particular chunk's prefix length.
+            forward_context.attn_metadata.max_query_length = chunk;
+            forward_context.attn_metadata.max_sequence_length = nblocks * page_size;
+            forward_context.mamba_metadata = {input.input_offsets, std::nullopt, std::nullopt};
+            try {
+                barrier_->wait();
+                (void)model_->forward(input, forward_context_);
+                runtime_.syncStream();
+                GraphRecordingGuard recording{runtime_};
+                auto output = model_->forward(input, forward_context_);
+                auto graph = recording.finish();
+                barrier_->wait();
+                candidate_prefill.emplace(b, make_compiled_result(std::move(input), std::move(graph), output));
+            } catch (...) {
+                try {
+                    runtime_.syncStream();
+                } catch (...) {
+                    std::terminate();
+                }
+                throw;
+            }
+        }
+
         // No graph becomes available until every touched slot and metadata
         // reference has been restored. Failure destroys candidates, not a
         // partially published collection of plans.
         prepare_state.restore();
         compiled_map_decode_.swap(candidate_decode);
+        compiled_map_prefill_.swap(candidate_prefill);
         compiled_short_decode_b1_.swap(candidate_short_decode);
         block_tables_holder_ = std::move(candidate_holder);
         short_block_tables_holder_ = std::move(candidate_short_holder);
@@ -348,8 +439,36 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
     CompiledResult *selected_result = nullptr;
     bool use_short_decode_graph = false;
     size_t required_pages = 0;
-    {
-        // Compiled paged plans are decode-only.
+    const bool prefill = input.input_ids.value()->size(1) != batch_size;
+    if (prefill) {
+        const auto found = compiled_map_prefill_.find(batch_size);
+        const size_t chunk = paged_config->prefill_chunk_size();
+        if (!paged_config->enable_chunk_prefill_graph()
+            || found == compiled_map_prefill_.end() || input.sample_all_positions
+            || block_per_req > paged_config->num_blocks()
+            || input.logical_kv_upper_bound != 0 || input.pixel_values || input.target_hidden_states
+            || input.input_ids.value()->size(0) != 1
+            || !is_cpu_contiguous_tensor(input.input_offsets, infinilm::runtime::DataType::kInt32, {batch_size + 1})
+            || !is_cpu_contiguous_tensor(input.cu_seqlens, infinilm::runtime::DataType::kInt32, {batch_size + 1})
+            || !is_cpu_contiguous_tensor(input.past_sequence_lengths, infinilm::runtime::DataType::kInt32, {batch_size})
+            || !is_cpu_contiguous_tensor(input.total_sequence_lengths, infinilm::runtime::DataType::kInt32, {batch_size})) {
+            return {nullptr, nullptr};
+        }
+        const auto *offsets = reinterpret_cast<const int32_t *>(input.input_offsets.value()->data());
+        const auto *cu = reinterpret_cast<const int32_t *>(input.cu_seqlens.value()->data());
+        const auto *past = reinterpret_cast<const int32_t *>(input.past_sequence_lengths.value()->data());
+        const auto *total = reinterpret_cast<const int32_t *>(input.total_sequence_lengths.value()->data());
+        if (!matches_paged_prefill_chunk(chunk, batch_size, input.input_ids.value()->size(1),
+                                        block_per_req * paged_config->block_size(),
+                                        offsets, cu, past, total)) {
+            return {nullptr, nullptr};
+        }
+        selected_result = &found->second;
+    } else {
+        if (!graph_config_.enable_decode_graph) {
+            return {nullptr, nullptr};
+        }
+        // Keep the existing one-token-per-request decode selection unchanged.
         if (!is_cpu_contiguous_tensor(input.input_offsets,
                                       infinilm::runtime::DataType::kInt32,
                                       {batch_size + 1})
@@ -446,6 +565,8 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
             graph_input.cu_seqlens, input.cu_seqlens)
         || !required_tensors_compatible(
             graph_input.slot_mapping, input.slot_mapping)
+        || (prefill && !required_tensors_compatible(
+            graph_input.past_sequence_lengths, input.past_sequence_lengths))
         || !optional_tensors_compatible(
             graph_input.mamba_init_state_indices,
             input.mamba_init_state_indices)
@@ -457,6 +578,9 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
     }
 
     graph_input.input_ids.value()->copy_from(runtime_, input.input_ids.value());
+    if (prefill) {
+        graph_input.past_sequence_lengths.value()->copy_from(runtime_, input.past_sequence_lengths.value());
+    }
     graph_input.position_ids.value()->copy_from(runtime_, input.position_ids.value());
     graph_input.total_sequence_lengths.value()->copy_from(runtime_, input.total_sequence_lengths.value());
     graph_input.input_offsets.value()->copy_from(runtime_, input.input_offsets.value());

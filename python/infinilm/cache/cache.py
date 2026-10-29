@@ -23,7 +23,14 @@ class PagedKVCacheConfig(CacheConfig, _infinilm.PagedKVCacheConfig):
         num_blocks: int,
         block_size: int = 256,
         max_batch_size: int = 1,
+        prefill_chunk_size: int = 1024,
+        enable_chunk_prefill_graph: bool = False,
     ):
         _infinilm.PagedKVCacheConfig.__init__(
-            self, num_blocks, block_size, max_batch_size
+            self,
+            num_blocks,
+            block_size,
+            max_batch_size,
+            prefill_chunk_size,
+            enable_chunk_prefill_graph,
         )

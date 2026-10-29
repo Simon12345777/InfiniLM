@@ -34,10 +34,14 @@ inline void bind_cache(py::module &m) {
                infinilm::cache::CacheConfig,
                std::shared_ptr<infinilm::cache::PagedKVCacheConfig>>(m, "PagedKVCacheConfig")
         .def(
-            py::init<size_t, size_t, size_t>(),
+            py::init<size_t, size_t, size_t, size_t, bool>(),
             py::arg("num_blocks"),
             py::arg("block_size") = 256,
-            py::arg("max_batch_size") = 1)
+            py::arg("max_batch_size") = 1,
+            py::arg("prefill_chunk_size") = 1024,
+            py::arg("enable_chunk_prefill_graph") = false)
+        .def("prefill_chunk_size", &infinilm::cache::PagedKVCacheConfig::prefill_chunk_size)
+        .def("enable_chunk_prefill_graph", &infinilm::cache::PagedKVCacheConfig::enable_chunk_prefill_graph)
         .def(
             "num_blocks",
             &infinilm::cache::PagedKVCacheConfig::num_blocks)

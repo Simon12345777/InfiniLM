@@ -18,6 +18,7 @@ struct PagedGraphConfig {
     int tp_size;
     int tp_rank;
     int pp_size; // Explicit caller topology; no default or TLS inference.
+    bool enable_decode_graph = true; // Original --enable-graph; chunk graphs use the cache's independent flag.
 
     void validate() const {
         if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size || pp_size <= 0) {
@@ -66,6 +67,7 @@ private:
     };
 
     std::optional<CompiledResult> compiled_short_decode_b1_;
+    std::map<size_t, CompiledResult> compiled_map_prefill_;
     std::map<
         std::pair<size_t, size_t>, // (num_requests, logical KV bound; 0=legacy full width)
         CompiledResult>
