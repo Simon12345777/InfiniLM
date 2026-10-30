@@ -17,9 +17,13 @@ For the Python API, pass `enable_chunked_prefill=True` and
 `max_num_batched_tokens` controls only the batch-wide token budget; the explicit
 budget takes precedence over `INFINILM_MAX_NUM_BATCHED_TOKENS`, with the model
 context length used as the default regardless of whether chunking is enabled.
-The actual chunk length is the minimum of `prefill_chunk_size`, the remaining
-batch budget, and the remaining prompt tokens. For example, a 2048-token batch
-budget can accommodate four 512-token chunks from four requests.
+Full chunks always contain exactly `prefill_chunk_size` tokens. For example, a
+2048-token batch budget can accommodate four 512-token chunks from four requests.
+A chunk that does not fit the remaining budget waits for another batch instead
+of being shortened. The batch budget must be at least `prefill_chunk_size` when
+chunked prefill is enabled. Short prompts and remaining tails smaller than a
+chunk are processed in separate ordinary prefill batches, never mixed with full
+chunks. Classification uses the remaining prompt length after prefix-cache reuse.
 Chunked prefill is disabled by default.
 
 To prepare and replay fixed-size prefill graphs, additionally pass
@@ -45,8 +49,8 @@ The native paged compiler records full `prefill_chunk_size` chunks after weights
 are loaded, for the supported batch-size buckets that fit the KV pool. Each
 request in a matching batch must contribute exactly one complete chunk. Replay
 updates token IDs, positions, past/total lengths, cumulative lengths, page tables
-and write slots in persistent device buffers. Short tails and mixed chunk sizes
-fall back to eager. One-token inputs use the existing decode-shaped graphs only
+and write slots in persistent device buffers. Ordinary prefill batches do not
+match full-chunk graphs. One-token inputs use the existing decode-shaped graphs only
 when `--enable-graph` is enabled; chunk prefill graph plans require a chunk size > 1.
 This path requires ordinary unquantized KV caches, a single pipeline stage and
 the paged/Flash Attention backend. Capture increases startup time and graph
@@ -57,8 +61,13 @@ memory usage. Rebuild the native extension after updating this code.
 demonstrate reduced GPU kernel-launch overhead. Performance improvement must be
 measured on the target hardware and workload.
 
-Each prefill batch stays within the token budget. Prefill and decode batches
-alternate when both have work; they are separate model forwards. Intermediate
+Each batch stays within the token budget. There are three scheduling batch types:
+`decode`, `prefill` (short prompts/tails), and `chunk` (fixed-size prompt slices).
+Decode alternates with prompt processing when both have work. On each prompt
+turn, the first schedulable request chooses ordinary prefill or chunk; only
+requests of that type can join the batch. No batch mixes these three types.
+The model-input `is_prefill` flag remains true for both prompt types, while
+`SchedulerOutput.is_chunk` and `batch_type` identify pure chunk batches. Intermediate
 chunks update KV state and publish only completed prefix blocks, without emitting
 tokens or advancing the request's sampling RNG. The last chunk produces the first
 output token. Prompt pages are reserved in full at admission, with decode

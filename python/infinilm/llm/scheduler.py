@@ -152,7 +152,11 @@ class SpeculativeCacheOps:
 
 
 class SchedulerOutput:
-    """Scheduler output containing scheduled requests and execution phase info."""
+    """One homogeneous decode, ordinary prefill, or fixed-size chunk batch.
+
+    is_prefill remains true for both prompt phases so processors use prompt
+    slices. is_chunk/batch_type distinguish the fixed-size graph candidates.
+    """
 
     def __init__(
         self,
@@ -160,10 +164,15 @@ class SchedulerOutput:
         is_prefill: bool = False,
         speculative_cache_ops: Optional[SpeculativeCacheOps] = None,
         nsa_owner=None,
+        is_chunk: bool = False,
     ):
+        if is_chunk and not is_prefill:
+            raise ValueError("a chunk batch must use prefill model inputs")
         self.scheduled_requests = scheduled_requests
         self.num_requests = len(scheduled_requests)
         self.is_prefill = is_prefill
+        self.is_chunk = is_chunk
+        self.batch_type = "chunk" if is_chunk else "prefill" if is_prefill else "decode"
         self.speculative_cache_ops = speculative_cache_ops
         self.kv_connector_metadata = None
         self.nsa_owner = nsa_owner
@@ -197,6 +206,10 @@ class Scheduler:
         self.prefill_chunk_size = prefill_chunk_size
         if max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive")
+        if enable_chunked_prefill and max_num_batched_tokens < prefill_chunk_size:
+            raise ValueError(
+                "max_num_batched_tokens must be >= prefill_chunk_size when chunked prefill is enabled"
+            )
         if enable_chunked_prefill and (
             connector is not None or has_mamba_cache or nsa_owner_pool_epoch is not None
         ):
@@ -700,21 +713,30 @@ class Scheduler:
         return None
 
     def _schedule_chunked(self) -> Optional[SchedulerOutput]:
-        """Alternate bounded prefill and decode batches, retaining prompt pages.
+        """Alternate decode with homogeneous ordinary-prefill or chunk batches.
 
         Reserve the full prompt on admission and decode headroom for every live
         request, so an admitted partial prefill cannot deadlock on allocation.
         Only successfully executed chunks publish their prefix-cache boundary.
+        The first schedulable prompt request selects the batch type, after prefix
+        lookup. Different types are deferred without acquiring prompt pages.
+        Every chunk has exactly prefill_chunk_size tokens; short prompts and
+        tails run in ordinary prefill batches and never fill spare chunk budget.
         """
         decode = not self.running_queue.sync_q.empty() and (
             self._prefer_decode or self.waiting_queue.sync_q.empty()
         )
         work_queue = self.running_queue.sync_q if decode else self.waiting_queue.sync_q
         scheduled = []
+        batch_is_chunk = None
         seen = set()
         budget = self.max_num_batched_tokens
         for _ in range(work_queue.qsize()):
-            if len(scheduled) >= self.max_batch_size or budget == 0:
+            if (
+                len(scheduled) >= self.max_batch_size
+                or budget == 0
+                or (batch_is_chunk and budget < self.prefill_chunk_size)
+            ):
                 break
             req = work_queue.get_nowait()
             self._dequeued_request = req
@@ -739,6 +761,8 @@ class Scheduler:
                 req.num_local_cached_tokens = req.get_total_length() - 1
                 count = 1
             else:
+                start = req.num_computed_tokens
+                cached = []
                 if not req.block_table:
                     cached, start = (
                         self.cache_manager.get_computed_blocks(
@@ -747,6 +771,17 @@ class Scheduler:
                         if self.enable_prefix_caching
                         else ([], 0)
                     )
+                remaining = req.get_prompt_length() - start
+                is_chunk = remaining >= self.prefill_chunk_size
+                count = self.prefill_chunk_size if is_chunk else remaining
+                if (
+                    batch_is_chunk is not None and is_chunk != batch_is_chunk
+                ) or count > budget:
+                    # Lookup takes references; deferral must release them.
+                    self.cache_manager.free_blocks(cached)
+                    work_queue.put(req)
+                    continue
+                if not req.block_table:
                     reserved = sum(
                         self._get_prefill_extra_blocks(other)
                         for other in self._active_requests.values()
@@ -778,10 +813,7 @@ class Scheduler:
                     req.num_blocks = len(req.block_table)
                     req.num_computed_tokens = start
                     req.num_cache_indexed_blocks = len(cached)
-                start = req.num_computed_tokens
-                count = min(
-                    self.prefill_chunk_size, budget, req.get_prompt_length() - start
-                )
+                batch_is_chunk = is_chunk
                 req.num_local_cached_tokens = start
                 req.prefill_chunk_end = start + count
                 req.slot_mapping = self.cache_manager.update_blocks_slot(
@@ -799,6 +831,7 @@ class Scheduler:
             scheduled,
             is_prefill=not decode,
             speculative_cache_ops=self.speculative_cache_ops,
+            is_chunk=batch_is_chunk is True,
         )
 
     def update_waiting_for_remote_kv(self, request: InferenceRequest):

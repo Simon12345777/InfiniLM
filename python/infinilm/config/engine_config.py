@@ -90,6 +90,14 @@ class EngineConfig:
             or self.max_num_batched_tokens < 1
         ):
             raise ValueError("max_num_batched_tokens must be a positive integer")
+        if (
+            self.enable_chunked_prefill
+            and self.max_num_batched_tokens is not None
+            and self.max_num_batched_tokens < self.prefill_chunk_size
+        ):
+            raise ValueError(
+                "max_num_batched_tokens must be >= prefill_chunk_size when chunked prefill is enabled"
+            )
         if self.enable_chunked_prefill and (
             self.cache_type != "paged"
             or self.draft_model_path is not None
