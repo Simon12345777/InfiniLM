@@ -99,7 +99,7 @@ def parse_args(argv=None, default_workload="burstgpt"):
     p.add_argument("--temperature", type=float, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--warmup-requests", type=int, default=8)
-    p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--server-timeout", type=float, default=900)
     p.add_argument("--request-timeout", type=float, default=600)
     p.add_argument("--result-dir", default=str(SCRIPT_DIR / "bench_results"))
