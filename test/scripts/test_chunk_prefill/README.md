@@ -86,9 +86,17 @@ python test/scripts/test_chunk_prefill/test_burstgpt_bench.py \
   记录多次运行的中位数、最小值、最大值。
 - `bench_results/<时间>/` 保存配置、每组 JSON、服务日志、`summary.json`。
   `--save-detailed` 额外保存逐请求文本和时序。请求指纹用于校验各组负载相同。
-- 服务 API 暂不暴露 graph replay 计数，因此 `graph_replay_verified=false`；
-  `potential_full_chunks` 只是输入形状估算。图开关对比可测量端到端影响，
-  要证明实际 device graph replay 或 kernel launch 减少，仍需在目标设备上使用 profiler。
+- 原生服务现在记录 `chunk_prefill_graph_plan`（录制结果）和
+  `chunk_prefill_graph_execution`（实际执行结果）。后者每个 worker 的每种执行模式
+  只记录一次，避免逐 batch 打日志干扰测量。客户端从服务日志提取
+  `graph_execution_evidence`；观察到 device segment 实际回放时，
+  `graph_replay_verified=true`。该证据包含预热，不代表所有 chunk 都命中，也不是命中率。
+  `--show-server-output` 将日志输出到终端而非文件时，自动验证不可用。
+- 若实际模式是 `host_replay`，检查 `reason`：`graph_runtime_not_built` 表示未编译
+  device graph 支持；`disabled_by_environment` 表示环境变量禁用了 device graph；
+  `unqualified_capture_operator` 表示存在未通过捕获资格检查的算子。
+  `eager` / `no_matching_plan` 则需要检查录图是否成功及输入形状是否匹配。
+  `potential_full_chunks` 仍只是输入形状估算。量化 kernel launch 减少仍需 profiler。
 
 加 `--dry-run` 可仅检查服务端和客户端命令。单跑组别使用
 `--modes baseline`、`--modes chunk` 或 `--modes chunk_graph`。

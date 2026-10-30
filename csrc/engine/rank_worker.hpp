@@ -201,6 +201,7 @@ private:
 
     // Graph Compiling
     bool enable_graph_compiling_;
+    unsigned chunk_graph_reported_modes_{0};
     std::unique_ptr<GraphCompiler> compiler_;
     StaticDecodeMetadata static_decode_metadata_;
     // Worker-owned cache configuration; refreshed only after model/cache creation.

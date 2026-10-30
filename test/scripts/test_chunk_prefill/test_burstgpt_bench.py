@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import signal
 import socket
@@ -334,6 +335,34 @@ def wait_for_server(args, proc):
     raise TimeoutError("server startup timeout")
 
 
+def graph_diagnostics(log_text):
+    """Evidence of actual execution, distinct from successful plan capture.
+
+    Logs include warmup and report each outcome once, not replay counts/rates.
+    """
+    events = []
+    for match in re.finditer(
+        r"chunk_prefill_graph_execution rank=(\d+) mode=(\w+) "
+        r"device_segments=(\d+) host_segments=(\d+) reason=([^\r\n]*)",
+        log_text,
+    ):
+        rank, mode, device, host, reason = match.groups()
+        events.append(
+            dict(
+                rank=int(rank),
+                mode=mode,
+                device_segments=int(device),
+                host_segments=int(host),
+                reason=reason.strip(),
+            )
+        )
+    return {
+        "graph_replay_verified": any(e["device_segments"] > 0 for e in events),
+        "graph_execution_evidence": events,
+        "graph_evidence_scope": "Observed outcomes include warmup; not a hit rate or proof that every chunk replayed.",
+    }
+
+
 def run_mode(args, mode, result_path):
     if port_busy(args.client_host, args.port):
         raise RuntimeError("benchmark port is already in use; select an unused --port")
@@ -364,6 +393,21 @@ def run_mode(args, mode, result_path):
                     f"benchmark failed; inspect {result_path} and {log_path}"
                 )
             result = json.loads(result_path.read_text(encoding="utf-8"))
+            log.flush()
+            result.update(
+                graph_diagnostics(
+                    log_path.read_text(encoding="utf-8", errors="replace")
+                )
+            )
+            if mode == "chunk_graph":
+                print(
+                    "Chunk graph execution evidence:",
+                    result["graph_execution_evidence"],
+                )
+                if not result["graph_replay_verified"]:
+                    print(
+                        "No device graph replay verified. Inspect server logs for host fallback or missing plans."
+                    )
             result.update(
                 mode=mode,
                 startup_s=startup_s,
@@ -504,13 +548,17 @@ def main(argv=None, default_workload="burstgpt"):
             results.append(result)
     summary = summarize(results)
     summary["runs"] = results
-    summary["graph_replay_verified"] = False
+    graph_runs = [r for r in results if r["mode"] == "chunk_graph"]
+    summary["graph_replay_verified"] = bool(graph_runs) and all(
+        r["graph_replay_verified"] for r in graph_runs
+    )
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
     print(
-        "\nGraph mode is an end-to-end flag comparison, not proof of device graph replay."
+        "\nDevice graph replay observed in every graph run: "
+        f"{summary['graph_replay_verified']} (includes warmup; not a hit rate)."
     )
     print(
         "Current prefill-first scheduling can delay decode under sustained prompt traffic."

@@ -63,13 +63,22 @@ infinilm::runtime::Tensor PagedAttentionImpl::forward(const AttentionLayer &laye
         if (seq_len > max_length || (page_size != 0 && block_width > max_length / page_size)) {
             throw std::invalid_argument("Paged prefill maximum length exceeds int64");
         }
-        const auto max_seqlen_k = block_width * page_size;
+        // These are per-request maxima, not the packed batch token count.
+        // During graph capture they are fixed safe bounds; replay updates the
+        // actual per-request lengths through the device offset tensors.
+        const auto max_seqlen_q = attn_metadata.max_query_length;
+        const auto max_seqlen_k = attn_metadata.max_sequence_length;
+        if (max_seqlen_q == 0 || max_seqlen_q > seq_len
+            || max_seqlen_k == 0 || max_seqlen_k > block_width * page_size
+            || max_seqlen_k > max_length) {
+            throw std::invalid_argument("Paged prefill requires valid per-request maximum lengths");
+        }
         infinilm::execution::submit<infini::ops::FlashAttnVarlenFunc>(
             runtime, infinilm::execution::RecordingPolicy::DeviceOnly,
             infini::ops::Config::Automatic(),
             query, k_total, v_total, input_offsets.value(), cu_seqlens.value(),
             std::optional<infinilm::runtime::Tensor>{}, std::optional<infinilm::runtime::Tensor>{block_tables.value()},
-            static_cast<int64_t>(seq_len), static_cast<int64_t>(max_seqlen_k),
+            static_cast<int64_t>(max_seqlen_q), static_cast<int64_t>(max_seqlen_k),
             0.0, std::optional<double>{scale_}, true, layer.window_size(), 0.0, false, false,
             attn_output, std::optional<infinilm::runtime::Tensor>{}, std::optional<infinilm::runtime::Tensor>{});
         INFINILM_TRACE_OP(MultiheadAttentionVarlen, attn_output);

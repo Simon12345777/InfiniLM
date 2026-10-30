@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <limits>
 #include <optional>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -369,8 +370,18 @@ void PagedCompiler::compile() {
                 0));
         }
 
+        // A single request cannot use more than its model context. Avoid
+        // recording attention against the entire multi-request KV pool.
+        size_t prefill_width = nblocks;
+        if (!prefill_batches.empty()) {
+            const size_t context_limit = model_config
+                                             ? model_config->get_or<size_t>("max_position_embeddings", nblocks * page_size)
+                                             : nblocks * page_size;
+            prefill_width = std::min(nblocks,
+                1 + (std::max(chunk, context_limit) - 1) / page_size);
+        }
         for (size_t b : prefill_batches) {
-            auto input = make_decode_input(b, nblocks, candidate_holder, 0);
+            auto input = make_decode_input(b, prefill_width, candidate_holder, 0);
             const size_t tokens = b * chunk;
             const size_t pages = 1 + (chunk - 1) / page_size;
             using infinilm::runtime::Tensor;
@@ -382,11 +393,11 @@ void PagedCompiler::compile() {
             };
             std::vector<int64_t> ids(tokens, 0), positions(tokens), slots(tokens);
             std::vector<int32_t> offsets(b + 1), totals(b, static_cast<int32_t>(chunk)), past(b, 0);
-            std::vector<int32_t> table(b * nblocks, -1);
+            std::vector<int32_t> table(b * prefill_width, -1);
             for (size_t row = 0; row < b; ++row) {
                 offsets[row] = static_cast<int32_t>(row * chunk);
                 for (size_t page = 0; page < pages; ++page) {
-                    table[row * nblocks + page] = static_cast<int32_t>(row * pages + page);
+                    table[row * prefill_width + page] = static_cast<int32_t>(row * pages + page);
                 }
                 for (size_t token = 0; token < chunk; ++token) {
                     positions[row * chunk + token] = static_cast<int64_t>(token);
@@ -408,7 +419,7 @@ void PagedCompiler::compile() {
             // Capture static upper bounds, but keep actual lengths in mutable
             // device tensors. Never freeze a particular chunk's prefix length.
             forward_context.attn_metadata.max_query_length = chunk;
-            forward_context.attn_metadata.max_sequence_length = nblocks * page_size;
+            forward_context.attn_metadata.max_sequence_length = prefill_width * page_size;
             forward_context.mamba_metadata = {input.input_offsets, std::nullopt, std::nullopt};
             try {
                 barrier_->wait();
@@ -418,6 +429,10 @@ void PagedCompiler::compile() {
                 auto output = model_->forward(input, forward_context_);
                 auto graph = recording.finish();
                 barrier_->wait();
+                const auto report = graph->execution_report();
+                spdlog::info("chunk_prefill_graph_plan rank={} batch={} chunk={} kv_bound={} device_segments={} host_segments={} reason={}",
+                             graph_config_.tp_rank, b, chunk, prefill_width * page_size,
+                             report.device_graph_segments, report.host_segments, report.fallback_reason);
                 candidate_prefill.emplace(b, make_compiled_result(std::move(input), std::move(graph), output));
             } catch (...) {
                 try {

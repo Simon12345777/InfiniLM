@@ -867,6 +867,24 @@ void RankWorker::thread_loop() {
                                     hidden_states = output->hidden_states;
                                 }
                             }
+                            // Report each observed outcome once per worker, so
+                            // diagnostics do not add per-step log I/O to timing.
+                            const auto *chunk_config = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config());
+                            if (chunk_config && chunk_config->enable_chunk_prefill_graph()
+                                && effective_args.input_ids && effective_args.total_sequence_lengths
+                                && effective_args.input_ids.value()->numel()
+                                       > effective_args.total_sequence_lengths.value()->numel()) {
+                                const auto device_segments = graph_execution ? graph_execution->device_graph_segments : 0;
+                                const auto host_segments = graph_execution ? graph_execution->host_segments : 0;
+                                const unsigned outcome = !graph_execution ? 1 : device_segments == 0 ? 2 : host_segments == 0 ? 4 : 8;
+                                if (!(chunk_graph_reported_modes_ & outcome)) {
+                                    chunk_graph_reported_modes_ |= outcome;
+                                    const char *mode = outcome == 1 ? "eager" : outcome == 2 ? "host_replay" : outcome == 4 ? "device_graph" : "mixed_graph";
+                                    spdlog::info("chunk_prefill_graph_execution rank={} mode={} device_segments={} host_segments={} reason={}",
+                                                 rank_info_.tp_rank, mode, device_segments, host_segments,
+                                                 graph_execution ? graph_execution->fallback_reason : eager_reason);
+                                }
+                            }
                             // Fall back to eager mode
                             if (!logits) {
                                 auto model_args = effective_args.to_model_input(
