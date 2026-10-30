@@ -1,79 +1,26 @@
 #!/usr/bin/env python3
-"""纯 Python 版 BurstGPT 在线压测客户端，可无缝替换 `vllm bench serve`。
+"""Streaming benchmark for InfiniLM; event gaps are not kernel/token timings."""
 
-设计目标：
-  * 复刻 vLLM benchmark serve 的行为(BurstGPT 采样、gamma/泊松到达、并发上限、
-    流式 TTFT/ITL/TPOT 统计);
-  * 写出与 vLLM 完全相同字段的结果 JSON(供测试脚本 load_result 读取)。
-
-只依赖标准库 + numpy + pandas + transformers，不需要 aiohttp / vllm。
-"""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import hashlib
 import http.client
 import json
+import math
 import os
-import sys
+import random
 import time
-import traceback
 import urllib.parse
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import numpy as np
-import pandas as pd
-
-MILLISECONDS = 1000.0
 
 
-# --------------------------------------------------------------------------- #
-# 命令行参数：与 vLLM benchmark serve 的子集保持同名，未用到的也照单接收以便兼容。
-# --------------------------------------------------------------------------- #
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    # 兼容 `vllm bench serve ...` 这种前缀调用
-    if argv[:2] == ["bench", "serve"]:
-        argv = argv[2:]
-
-    p = argparse.ArgumentParser(prog="pure bench serve")
-    p.add_argument("--backend", default="openai-chat")
-    p.add_argument("--base-url", required=True)
-    p.add_argument("--endpoint", default="/v1/chat/completions")
-    p.add_argument("--model", required=True)
-    p.add_argument("--tokenizer", default=None)
-    p.add_argument("--dataset-name", default="burstgpt")
-    p.add_argument("--dataset-path", required=True)
-    p.add_argument("--num-prompts", type=int, default=100)
-    p.add_argument("--request-rate", default="inf")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--burstiness", type=float, default=1.0)
-    p.add_argument("--max-concurrency", type=int, default=None)
-    p.add_argument("--temperature", type=float, default=None)
-    p.add_argument("--ignore-eos", action="store_true")
-    p.add_argument("--request-timeout", type=float, default=600.0)
-    # 仅为兼容，不影响逻辑：
-    p.add_argument("--disable-tqdm", action="store_true")
-    p.add_argument("--save-result", action="store_true")
-    p.add_argument("--save-detailed", action="store_true")
-    p.add_argument("--result-dir", default=None)
-    p.add_argument("--result-filename", default=None)
-    p.add_argument("--metric-percentiles", default="99")
-    # 兜底：吞掉任何其它未知参数，避免因 vLLM 新增 flag 而崩
-    args, unknown = p.parse_known_args(argv)
-    if unknown:
-        print(f"[pure-bench] 忽略未识别参数: {unknown}")
-    return args
-
-
-def parse_rate(value: str) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    return float("inf") if value.lower() in {"inf", "infinity"} else float(value)
-
-
-# --------------------------------------------------------------------------- #
-# BurstGPT 数据集采样：严格对齐 vLLM BurstGPTDataset
-# --------------------------------------------------------------------------- #
 @dataclass
 class SampleRequest:
     prompt: str
@@ -81,286 +28,451 @@ class SampleRequest:
     expected_output_len: int
 
 
-def sample_burstgpt(dataset_path: str, num_requests: int, seed: int, tokenizer) -> list[SampleRequest]:
-    df = pd.read_csv(dataset_path)
-    gpt4 = df[df["Model"] == "GPT-4"]
-    gpt4 = gpt4[gpt4["Response tokens"] > 0]
-    if len(gpt4) == 0:
-        raise RuntimeError(f"BurstGPT 过滤后为空: {dataset_path}")
-    replace = num_requests > len(gpt4)
-    data = gpt4.sample(n=num_requests, random_state=seed, replace=replace).values.tolist()
-
-    vocab_size = tokenizer.vocab_size
-    samples: list[SampleRequest] = []
-    for i in range(num_requests):
-        input_len = int(data[i][2])   # Request tokens
-        output_len = int(data[i][3])  # Response tokens
-        token_ids = [(i + j) % vocab_size for j in range(input_len)]
-        prompt = tokenizer.decode(token_ids)
-        samples.append(SampleRequest(prompt, input_len, output_len))
-    return samples
-
-
-# --------------------------------------------------------------------------- #
-# 到达时刻：复刻 vLLM get_request 的 gamma 采样 + 归一化
-# --------------------------------------------------------------------------- #
-def build_delays(n: int, request_rate: float, burstiness: float) -> list[float]:
-    delays: list[float] = []
-    for _ in range(n):
-        if request_rate == float("inf"):
-            delays.append(0.0)
-        elif burstiness == float("inf"):
-            delays.append(1.0 / request_rate)
-        else:
-            theta = 1.0 / (request_rate * burstiness)
-            delays.append(float(np.random.gamma(shape=burstiness, scale=theta)))
-    for i in range(1, n):
-        delays[i] += delays[i - 1]
-    if request_rate != float("inf") and delays and delays[-1] != 0:
-        target_total = n / request_rate
-        factor = target_total / delays[-1]
-        delays = [d * factor for d in delays]
-    return delays
-
-
-# --------------------------------------------------------------------------- #
-# 单请求：流式 chat completions，测 TTFT / ITL / latency / output_tokens
-# --------------------------------------------------------------------------- #
 @dataclass
 class RequestOutput:
-    prompt_len: int = 0
     success: bool = False
     generated_text: str = ""
     output_tokens: int | None = None
-    ttft: float = 0.0
+    token_count_source: str = ""
+    ttft: float | None = None
     latency: float = 0.0
+    last_content_time: float | None = None
     itl: list[float] = field(default_factory=list)
-    start_time: float = 0.0
+    client_queue_s: float = 0.0
+    finish_reason: str | None = None
     error: str = ""
 
 
-def _do_request_blocking(
-    base_url: str,
-    endpoint: str,
-    model: str,
-    req: SampleRequest,
-    temperature: float,
-    ignore_eos: bool,
-    timeout: float,
-) -> RequestOutput:
-    out = RequestOutput(prompt_len=req.prompt_len)
-    parsed = urllib.parse.urlparse(base_url)
-    host = parsed.hostname
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    path = (parsed.path.rstrip("/") + endpoint) if parsed.path not in ("", "/") else endpoint
+def parse_rate(value):
+    rate = float(value)
+    if math.isnan(rate) or rate <= 0:
+        raise argparse.ArgumentTypeError("rate must be positive or inf")
+    return rate
 
+
+def parse_args(argv=None, default_dataset="burstgpt"):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--base-url", required=True)
+    p.add_argument("--endpoint", default="/v1/chat/completions")
+    p.add_argument("--model", required=True)
+    p.add_argument("--tokenizer")
+    p.add_argument(
+        "--dataset-name",
+        choices=["burstgpt", "uniform", "mixed"],
+        default=default_dataset,
+    )
+    p.add_argument("--dataset-path")
+    p.add_argument("--num-prompts", type=int, default=64)
+    p.add_argument("--request-rate", type=parse_rate, default=float("inf"))
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--burstiness", type=parse_rate, default=1.0)
+    p.add_argument("--max-concurrency", type=int, default=16)
+    p.add_argument("--long-input-tokens", type=int, default=4096)
+    p.add_argument("--short-input-tokens", type=int, default=128)
+    p.add_argument("--long-ratio", type=float, default=0.5)
+    p.add_argument("--output-tokens", type=int, default=32)
+    p.add_argument("--prefill-chunk-size", type=int, default=256)
+    p.add_argument("--max-request-tokens", type=int, default=8192)
+    p.add_argument("--max-response-tokens", type=int, default=256)
+    p.add_argument("--use-full-dataset", action="store_true")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Require length finish; server must also use --ignore-eos.",
+    )
+    p.add_argument("--warmup-requests", type=int, default=8)
+    p.add_argument("--request-timeout", type=float, default=600)
+    p.add_argument("--metric-percentiles", default="50,95,99")
+    p.add_argument("--save-result", action="store_true")
+    p.add_argument("--save-detailed", action="store_true")
+    p.add_argument("--result-dir")
+    p.add_argument("--result-filename")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--backend", choices=["openai-chat"], default="openai-chat")
+    p.add_argument("--disable-tqdm", action="store_true")
+    args = p.parse_args(argv)
+    for name in (
+        "num_prompts",
+        "max_concurrency",
+        "long_input_tokens",
+        "short_input_tokens",
+        "output_tokens",
+        "prefill_chunk_size",
+        "max_request_tokens",
+        "max_response_tokens",
+    ):
+        if getattr(args, name) <= 0:
+            p.error(f"--{name.replace('_', '-')} must be positive")
+    if (
+        args.warmup_requests < 0
+        or not math.isfinite(args.request_timeout)
+        or args.request_timeout <= 0
+    ):
+        p.error("warmup must be nonnegative and timeout positive/finite")
+    if not 0 < args.long_ratio < 1:
+        p.error("--long-ratio must be between 0 and 1")
+    if args.dataset_name == "burstgpt" and not args.dataset_path:
+        p.error("--dataset-path is required for BurstGPT")
+    if args.dataset_name == "mixed" and args.num_prompts < 2:
+        p.error("mixed workload needs at least two requests")
+    if bool(args.result_dir) != bool(args.result_filename):
+        p.error("--result-dir and --result-filename must be supplied together")
+    return args
+
+
+def chat_length(tokenizer, prompt):
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return len(tokenizer(rendered, add_special_tokens=False).input_ids)
+
+
+def make_prompt(tokenizer, target, nonce):
+    prefix = f"Request {nonce}. Continue this text:"
+    repeats = max(1, target - chat_length(tokenizer, prefix))
+    prompt = prefix + " hello" * repeats
+    # Target is approximate; always report the locally tokenized chat length.
+    for _ in range(4):
+        adjusted = max(1, repeats + target - chat_length(tokenizer, prompt))
+        if adjusted == repeats:
+            break
+        repeats = adjusted
+        prompt = prefix + " hello" * repeats
+    return prompt, chat_length(tokenizer, prompt)
+
+
+def sample_requests(args, tokenizer, *, warmup=False):
+    seed = args.seed + (1_000_003 if warmup else 0)
+    rng = random.Random(seed)
+    n = args.warmup_requests if warmup else args.num_prompts
+    if not n:
+        return []
+    if args.dataset_name == "burstgpt":
+        with open(args.dataset_path, newline="", encoding="utf-8") as f:
+            rows = [
+                (int(r["Request tokens"]), int(r["Response tokens"]))
+                for r in csv.DictReader(f)
+                if r["Model"] == "GPT-4"
+                and int(r["Request tokens"]) > 0
+                and int(r["Response tokens"]) > 0
+            ]
+        if not args.use_full_dataset:
+            rows = [
+                (a, b)
+                for a, b in rows
+                if a <= args.max_request_tokens and b <= args.max_response_tokens
+            ]
+        if not rows:
+            raise ValueError("No valid BurstGPT rows after filtering")
+        lengths = rng.sample(rows, n) if n <= len(rows) else rng.choices(rows, k=n)
+    else:
+        long_count = (
+            n
+            if args.dataset_name == "uniform"
+            else max(1, min(n - 1, round(n * args.long_ratio)))
+        )
+        lengths = [(args.long_input_tokens, args.output_tokens)] * long_count
+        lengths += [(args.short_input_tokens, args.output_tokens)] * (n - long_count)
+        rng.shuffle(lengths)
+    requests = []
+    for i, (input_len, output_len) in enumerate(lengths):
+        prompt, actual_len = make_prompt(tokenizer, input_len, f"{seed:08x}-{i:06x}")
+        if args.dataset_name != "burstgpt":
+            intended_long = input_len == args.long_input_tokens
+            if (actual_len >= args.prefill_chunk_size) != intended_long:
+                raise ValueError(
+                    "Synthetic prompt is in wrong chunk class; adjust input lengths"
+                )
+        requests.append(SampleRequest(prompt, actual_len, output_len))
+    return requests
+
+
+def build_delays(n, request_rate, burstiness, seed=0):
+    if math.isinf(request_rate):
+        return [0.0] * n
+    rng = np.random.default_rng(seed)
+    gaps = (
+        np.full(max(0, n - 1), 1 / request_rate)
+        if math.isinf(burstiness)
+        else rng.gamma(burstiness, 1 / (request_rate * burstiness), max(0, n - 1))
+    )
+    return [0.0, *np.cumsum(gaps).tolist()][:n]
+
+
+def _do_request_blocking(
+    base_url, endpoint, model, req, temperature, ignore_eos, timeout, scheduled_at=None
+):
+    out = RequestOutput()
+    parsed = urllib.parse.urlparse(base_url)
+    path = parsed.path.rstrip("/") + "/" + endpoint.lstrip("/")
+    conn_cls = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    conn = conn_cls(parsed.hostname, parsed.port, timeout=timeout)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": req.prompt}],
         "temperature": temperature,
-        "max_completion_tokens": req.expected_output_len,
+        "max_tokens": req.expected_output_len,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if ignore_eos:
-        payload["ignore_eos"] = True
-    body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(host, port, timeout=timeout)
-    st = time.perf_counter()
-    out.start_time = st
-    most_recent = st
-    generated = ""
+    if os.environ.get("OPENAI_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['OPENAI_API_KEY']}"
+    start = time.perf_counter()
+    out.client_queue_s = (
+        max(0.0, start - scheduled_at) if scheduled_at is not None else 0.0
+    )
+    previous_content = None
+    done = False
     try:
-        conn.request("POST", path, body=body, headers=headers)
-        resp = conn.getresponse()
-        if resp.status != 200:
-            out.error = f"HTTP {resp.status} {resp.reason}"
-            return out
-        for raw in resp:  # 按 chunk/行迭代，数据到达即返回，可测 TTFT
+        conn.request("POST", path, body=json.dumps(payload).encode(), headers=headers)
+        response = conn.getresponse()
+        if response.status != 200:
+            raise RuntimeError(
+                f"HTTP {response.status}: {response.read(2048).decode(errors='replace')}"
+            )
+        for raw in response:
+            if time.perf_counter() - start > timeout:
+                raise TimeoutError("request deadline exceeded")
             line = raw.strip()
-            if not line or line.startswith(b":"):
-                continue
             if not line.startswith(b"data:"):
                 continue
-            chunk = line[len(b"data:"):].strip()
-            if chunk == b"[DONE]":
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                done = True
+                break
+            event = json.loads(data)
+            if event.get("error"):
+                raise RuntimeError(str(event["error"]))
+            usage = event.get("usage") or {}
+            if usage.get("completion_tokens") is not None:
+                out.output_tokens = int(usage["completion_tokens"])
+                out.token_count_source = "server_usage"
+            choices = event.get("choices") or []
+            if not choices:
                 continue
-            now = time.perf_counter()
-            data = json.loads(chunk)
-            choices = data.get("choices")
-            if choices:
-                delta = choices[0].get("delta", {})
-                content = delta.get("content")
-                if out.ttft == 0.0:
-                    out.ttft = now - st
-                else:
-                    out.itl.append(now - most_recent)
-                generated += content or ""
-                most_recent = now
-            usage = data.get("usage")
-            if usage and usage.get("completion_tokens") is not None:
-                out.output_tokens = usage.get("completion_tokens")
-        out.generated_text = generated
-        out.latency = most_recent - st
+            choice = choices[0]
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                out.finish_reason = reason
+                if reason not in ("stop", "length"):
+                    raise RuntimeError(f"unsuccessful finish_reason: {reason}")
+            delta = choice.get("delta") or {}
+            content = (delta.get("content") or "") + (
+                delta.get("reasoning_content") or ""
+            )
+            if content:
+                now = time.perf_counter()
+                if out.ttft is None:
+                    out.ttft = now - start
+                if previous_content is not None:
+                    out.itl.append(now - previous_content)
+                previous_content = now
+                out.last_content_time = now - start
+                out.generated_text += content
+        out.latency = time.perf_counter() - start
+        if not done or out.finish_reason is None:
+            raise RuntimeError("truncated stream: missing finish_reason or [DONE]")
+        if ignore_eos and out.finish_reason != "length":
+            raise RuntimeError("expected length finish; start server with --ignore-eos")
+        if out.output_tokens is None and out.finish_reason == "length":
+            out.output_tokens = req.expected_output_len
+            out.token_count_source = "max_tokens_at_length_finish"
+        if ignore_eos and out.output_tokens != req.expected_output_len:
+            raise RuntimeError("output length differs from requested max_tokens")
         out.success = True
-    except Exception:
-        out.success = False
-        out.error = "".join(traceback.format_exception(*sys.exc_info()))
+    except Exception as exc:
+        out.latency = time.perf_counter() - start
+        out.error = f"{type(exc).__name__}: {exc}"
     finally:
         conn.close()
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 主压测循环：按到达计划派发，asyncio.Semaphore 控制并发上限
-# --------------------------------------------------------------------------- #
-async def run_benchmark(args, requests: list[SampleRequest], request_rate: float) -> tuple[list[RequestOutput], float]:
-    n = len(requests)
-    np.random.seed(args.seed)  # 与 vLLM 一致：到达采样前播种全局 numpy RNG
-    delays = build_delays(n, request_rate, args.burstiness)
-
-    sem = asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
-    temperature = 0.0 if args.temperature is None else args.temperature
-    outputs: list[RequestOutput | None] = [None] * n
-    done = 0
-
-    async def one(i: int) -> None:
-        nonlocal done
-        async def call() -> RequestOutput:
-            return await asyncio.to_thread(
-                _do_request_blocking,
-                args.base_url, args.endpoint, args.model, requests[i],
-                temperature, args.ignore_eos, args.request_timeout,
-            )
-        if sem is not None:
-            async with sem:
-                outputs[i] = await call()
-        else:
-            outputs[i] = await call()
-        done += 1
-        # 机器可解析的进度行：父进程(测试脚本)心跳据此显示"已完成多少条"
-        print(f"[pure-bench] PROGRESS {done}/{n}", flush=True)
-
-    start = time.perf_counter()
-    tasks: list[asyncio.Task] = []
-    for i in range(n):
-        wait = start + delays[i] - time.perf_counter()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        tasks.append(asyncio.create_task(one(i)))
-    await asyncio.gather(*tasks)
-    duration = time.perf_counter() - start
-    return [o for o in outputs], duration  # type: ignore[return-value]
-
-
-# --------------------------------------------------------------------------- #
-# 指标：完全对齐 vLLM calculate_metrics 的口径
-# --------------------------------------------------------------------------- #
-def compute_result(args, requests, outputs: list[RequestOutput], duration: float, tokenizer, percentiles: list[float]) -> dict:
-    actual_output_lens: list[int] = []
-    total_input = 0
+async def run_benchmark(args, requests, request_rate, *, progress=True):
+    sem = asyncio.Semaphore(args.max_concurrency)
+    delays = build_delays(len(requests), request_rate, args.burstiness, args.seed)
+    outputs = [None] * len(requests)
     completed = 0
-    ttfts: list[float] = []
-    tpots: list[float] = []
-    itls: list[float] = []
-    e2els: list[float] = []
-    failed = 0
+    start = time.perf_counter()
 
-    for i, o in enumerate(outputs):
-        if o.success:
-            out_len = o.output_tokens
-            if not out_len:
-                out_len = len(tokenizer(o.generated_text, add_special_tokens=False).input_ids)
-            actual_output_lens.append(out_len)
-            total_input += requests[i].prompt_len
-            if out_len > 1:
-                tpots.append((o.latency - o.ttft) / (out_len - 1))
-            itls += o.itl
-            ttfts.append(o.ttft)
-            e2els.append(o.latency)
-            completed += 1
-        else:
-            actual_output_lens.append(0)
-            failed += 1
+    async def one(i):
+        nonlocal completed
+        scheduled_at = start + delays[i]
+        await asyncio.sleep(max(0.0, scheduled_at - time.perf_counter()))
+        async with sem:
+            outputs[i] = await asyncio.to_thread(
+                _do_request_blocking,
+                args.base_url,
+                args.endpoint,
+                args.model,
+                requests[i],
+                args.temperature,
+                args.ignore_eos,
+                args.request_timeout,
+                scheduled_at,
+            )
+        completed += 1
+        if progress:
+            print(f"[pure-bench] PROGRESS {completed}/{len(requests)}", flush=True)
 
-    total_output = sum(actual_output_lens)
-    dur = duration
+    await asyncio.gather(*(one(i) for i in range(len(requests))))
+    return outputs, time.perf_counter() - start
 
-    def stats(key: str, vals: list[float], result: dict) -> None:
-        arr = vals or [0.0]
-        result[f"mean_{key}_ms"] = float(np.mean(arr) * MILLISECONDS)
-        result[f"median_{key}_ms"] = float(np.median(arr) * MILLISECONDS)
-        result[f"std_{key}_ms"] = float(np.std(arr) * MILLISECONDS)
-        for p in percentiles:
-            pw = str(int(p)) if int(p) == p else str(p)
-            result[f"p{pw}_{key}_ms"] = float(np.percentile(arr, p) * MILLISECONDS)
 
-    result: dict = {
-        "duration": dur,
-        "completed": completed,
-        "failed": failed,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "request_throughput": completed / dur if dur > 0 else 0.0,
-        "output_throughput": total_output / dur if dur > 0 else 0.0,
-        "total_token_throughput": (total_input + total_output) / dur if dur > 0 else 0.0,
-        "input_lens": [o.prompt_len for o in outputs],
-        "output_lens": actual_output_lens,
-        "ttfts": [o.ttft for o in outputs],
-        "itls": [o.itl for o in outputs],
-        "generated_texts": [o.generated_text for o in outputs],
-        "errors": [o.error for o in outputs],
+def compute_result(args, requests, outputs, duration, tokenizer, percentiles):
+    def metrics(indices):
+        successful = [i for i in indices if outputs[i].success]
+        result = {
+            "completed": len(successful),
+            "failed": len(indices) - len(successful),
+        }
+        series = {
+            k: []
+            for k in ("ttft", "tpot", "e2el", "itl", "client_queue", "offered_ttft")
+        }
+        for i in successful:
+            out = outputs[i]
+            if out.output_tokens is None:
+                out.output_tokens = len(
+                    tokenizer(out.generated_text, add_special_tokens=False).input_ids
+                )
+                out.token_count_source = "retokenized_text_estimate"
+            series["e2el"].append(out.latency)
+            series["client_queue"].append(out.client_queue_s)
+            series["itl"].extend(out.itl)
+            if out.ttft is not None:
+                series["ttft"].append(out.ttft)
+                series["offered_ttft"].append(out.ttft + out.client_queue_s)
+                if out.output_tokens > 1:
+                    series["tpot"].append(
+                        (out.last_content_time - out.ttft) / (out.output_tokens - 1)
+                    )
+        for key, values in series.items():
+            result[f"{key}_samples"] = len(values)
+            result[f"mean_{key}_ms"] = float(np.mean(values) * 1000) if values else None
+            for p in percentiles:
+                result[f"p{p:g}_{key}_ms"] = (
+                    float(np.percentile(values, p) * 1000) if values else None
+                )
+        result["total_input_tokens"] = sum(requests[i].prompt_len for i in successful)
+        result["total_output_tokens"] = sum(
+            outputs[i].output_tokens for i in successful
+        )
+        result["request_throughput"] = len(successful) / duration
+        result["input_throughput"] = result["total_input_tokens"] / duration
+        result["output_throughput"] = result["total_output_tokens"] / duration
+        return result
+
+    result = metrics(list(range(len(requests))))
+    result["duration"] = duration
+    result["groups"] = {
+        name: metrics(
+            [
+                i
+                for i, r in enumerate(requests)
+                if (r.prompt_len >= args.prefill_chunk_size) == long
+            ]
+        )
+        for name, long in (("short", False), ("long", True))
     }
-    stats("ttft", ttfts, result)
-    stats("tpot", tpots, result)
-    stats("itl", itls, result)
-    stats("e2el", e2els, result)
+    result["input_lens"] = [r.prompt_len for r in requests]
+    result["requested_output_lens"] = [r.expected_output_len for r in requests]
+    result["output_lens"] = [o.output_tokens for o in outputs]
+    result["token_count_sources"] = sorted(
+        {o.token_count_source for o in outputs if o.success}
+    )
+    result["errors"] = [o.error for o in outputs]
+    result["workload_sha256"] = hashlib.sha256(
+        json.dumps([asdict(r) for r in requests], sort_keys=True).encode()
+    ).hexdigest()
+    result["potential_full_chunks"] = sum(
+        r.prompt_len // args.prefill_chunk_size for r in requests
+    )
+    result["graph_replay_verified"] = False
+    result["measurement_notes"] = [
+        "Prompt counts use the local chat template with add_special_tokens=False, matching BasicLLMProcessor.",
+        "TTFT is first non-empty text, not internal first-token compute time.",
+        "ITL is content-event gaps; TPOT uses text arrival times and may include buffered tokens.",
+        "Client queue time is separate; offered TTFT includes that time.",
+        "Potential full chunks are shape estimates, not observed graph replay counts.",
+    ]
+    if args.save_detailed:
+        result["requests"] = [asdict(o) for o in outputs]
     return result
 
 
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    args = parse_args(sys.argv[1:])
-    request_rate = parse_rate(args.request_rate)
-    percentiles = [float(x) for x in str(args.metric_percentiles).split(",") if x.strip()]
+async def execute(args, requests, warmups):
+    # Avoid the default thread pool's hidden concurrency cap (often 32).
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=args.max_concurrency)
+    )
+    if warmups:
+        outputs, _ = await run_benchmark(args, warmups, float("inf"), progress=False)
+        if any(not o.success for o in outputs):
+            raise RuntimeError(
+                f"warmup failed: {[o.error for o in outputs if o.error]}"
+            )
+    return await run_benchmark(args, requests, args.request_rate)
 
+
+def main(argv=None, default_dataset="burstgpt"):
+    args = parse_args(argv, default_dataset)
+    percentiles = [float(p) for p in args.metric_percentiles.split(",")]
+    if any(not 0 <= p <= 100 for p in percentiles):
+        raise ValueError("percentiles must be in [0, 100]")
     from transformers import AutoTokenizer
-    tok_src = args.tokenizer or args.model
-    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
 
-    print(f"[pure-bench] 数据集={args.dataset_path} 请求数={args.num_prompts} "
-          f"速率={args.request_rate} burstiness={args.burstiness} "
-          f"并发上限={args.max_concurrency} seed={args.seed}")
-    requests = sample_burstgpt(args.dataset_path, args.num_prompts, args.seed, tokenizer)
-
-    outputs, duration = asyncio.run(run_benchmark(args, requests, request_rate))
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer or args.model, trust_remote_code=True
+    )
+    requests = sample_requests(args, tokenizer)
+    warmups = sample_requests(args, tokenizer, warmup=True)
+    print(
+        f"Workload={args.dataset_name}, input tokens={min(r.prompt_len for r in requests)}.."
+        f"{max(r.prompt_len for r in requests)}, concurrency={args.max_concurrency}",
+        flush=True,
+    )
+    outputs, duration = asyncio.run(execute(args, requests, warmups))
     result = compute_result(args, requests, outputs, duration, tokenizer, percentiles)
-
-    print(f"[pure-bench] 完成 {result['completed']}/{args.num_prompts}，失败 {result['failed']}，"
-          f"用时 {duration:.2f}s，请求吞吐 {result['request_throughput']:.3f} req/s，"
-          f"输出吞吐 {result['output_throughput']:.3f} tok/s，"
-          f"平均 TTFT {result['mean_ttft_ms']:.2f}ms，平均 TPOT {result['mean_tpot_ms']:.2f}ms")
-
-    if args.save_result and args.result_dir and args.result_filename:
-        os.makedirs(args.result_dir, exist_ok=True)
-        out_path = os.path.join(args.result_dir, args.result_filename)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False)
-        print(f"[pure-bench] 结果已写入 {out_path}")
-    else:
-        # 即便没要求保存，也按 result-dir/result-filename 写出，保证测试脚本能 load_result
-        if args.result_dir and args.result_filename:
-            os.makedirs(args.result_dir, exist_ok=True)
-            out_path = os.path.join(args.result_dir, args.result_filename)
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False)
-            print(f"[pure-bench] 结果已写入 {out_path}")
+    result["config"] = {
+        k: ("inf" if isinstance(v, float) and math.isinf(v) else v)
+        for k, v in vars(args).items()
+    }
+    keys = (
+        "completed",
+        "failed",
+        "duration",
+        "request_throughput",
+        "input_throughput",
+        "output_throughput",
+        "mean_ttft_ms",
+        "mean_tpot_ms",
+    )
+    print(json.dumps({k: result[k] for k in keys}, indent=2, ensure_ascii=False))
+    if args.result_dir:
+        path = Path(args.result_dir) / args.result_filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        print(f"Result: {path}")
+    if args.verbose:
+        for out in outputs:
+            print(out)
+    if result["failed"]:
+        for error in result["errors"]:
+            if error:
+                print(error)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

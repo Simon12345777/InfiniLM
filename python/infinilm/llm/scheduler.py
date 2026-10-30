@@ -217,7 +217,7 @@ class Scheduler:
                 "chunked prefill requires standard paged attention without KV transfer"
             )
         self.enable_chunked_prefill = enable_chunked_prefill
-        self._prefer_decode = False
+        self._consecutive_ordinary_prefill_batches = 0
         if nsa_owner_pool_epoch is not None and (
             connector is not None or has_mamba_cache
         ):
@@ -713,22 +713,40 @@ class Scheduler:
         return None
 
     def _schedule_chunked(self) -> Optional[SchedulerOutput]:
-        """Alternate decode with homogeneous ordinary-prefill or chunk batches.
+        """Prefer ordinary prefill, yielding to chunks after two prompt batches.
+
+        Decode runs only when neither prompt type can produce a batch. Decode
+        and empty scheduling attempts do not reset the prompt-turn counter.
+        """
+        prefer_chunk = self._consecutive_ordinary_prefill_batches >= 2
+        for is_chunk in (prefer_chunk, not prefer_chunk):
+            output = self._schedule_chunked_batch(decode=False, batch_is_chunk=is_chunk)
+            if output is not None:
+                if is_chunk:
+                    self._consecutive_ordinary_prefill_batches = 0
+                else:
+                    # Keep yielding until a waiting chunk can actually run.
+                    self._consecutive_ordinary_prefill_batches = min(
+                        self._consecutive_ordinary_prefill_batches + 1, 2
+                    )
+                return output
+        return self._schedule_chunked_batch(decode=True)
+
+    def _schedule_chunked_batch(
+        self, *, decode: bool, batch_is_chunk: bool = False
+    ) -> Optional[SchedulerOutput]:
+        """Build one homogeneous batch of the requested type.
 
         Reserve the full prompt on admission and decode headroom for every live
         request, so an admitted partial prefill cannot deadlock on allocation.
         Only successfully executed chunks publish their prefix-cache boundary.
-        The first schedulable prompt request selects the batch type, after prefix
-        lookup. Different types are deferred without acquiring prompt pages.
+        Classify prompts after prefix lookup. Different types are deferred
+        without acquiring prompt pages.
         Every chunk has exactly prefill_chunk_size tokens; short prompts and
         tails run in ordinary prefill batches and never fill spare chunk budget.
         """
-        decode = not self.running_queue.sync_q.empty() and (
-            self._prefer_decode or self.waiting_queue.sync_q.empty()
-        )
         work_queue = self.running_queue.sync_q if decode else self.waiting_queue.sync_q
         scheduled = []
-        batch_is_chunk = None
         seen = set()
         budget = self.max_num_batched_tokens
         for _ in range(work_queue.qsize()):
@@ -774,9 +792,7 @@ class Scheduler:
                 remaining = req.get_prompt_length() - start
                 is_chunk = remaining >= self.prefill_chunk_size
                 count = self.prefill_chunk_size if is_chunk else remaining
-                if (
-                    batch_is_chunk is not None and is_chunk != batch_is_chunk
-                ) or count > budget:
+                if is_chunk != batch_is_chunk or count > budget:
                     # Lookup takes references; deferral must release them.
                     self.cache_manager.free_blocks(cached)
                     work_queue.put(req)
@@ -813,7 +829,6 @@ class Scheduler:
                     req.num_blocks = len(req.block_table)
                     req.num_computed_tokens = start
                     req.num_cache_indexed_blocks = len(cached)
-                batch_is_chunk = is_chunk
                 req.num_local_cached_tokens = start
                 req.prefill_chunk_end = start + count
                 req.slot_mapping = self.cache_manager.update_blocks_slot(
@@ -822,9 +837,6 @@ class Scheduler:
             budget -= count
             req.status = RequestStatus.RUNNING
             scheduled.append(req)
-        self._prefer_decode = not decode
-        if not scheduled and not decode and not self.running_queue.sync_q.empty():
-            return self._schedule_chunked()
         if not scheduled:
             return None
         return SchedulerOutput(

@@ -63,9 +63,13 @@ measured on the target hardware and workload.
 
 Each batch stays within the token budget. There are three scheduling batch types:
 `decode`, `prefill` (short prompts/tails), and `chunk` (fixed-size prompt slices).
-Decode alternates with prompt processing when both have work. On each prompt
-turn, the first schedulable request chooses ordinary prefill or chunk; only
-requests of that type can join the batch. No batch mixes these three types.
+Ordinary prefill has priority over full chunks. After two consecutive ordinary
+prefill batches, the next prompt turn tries chunks first. A successful chunk
+batch resets this counter; decode and empty scheduling attempts do not. If the
+preferred prompt type cannot produce a batch, the other prompt type is tried.
+Decode runs only when neither prompt type can produce a batch, without forced
+alternation. Sustained schedulable prompt traffic can therefore delay decode.
+No batch mixes these three types.
 The model-input `is_prefill` flag remains true for both prompt types, while
 `SchedulerOutput.is_chunk` and `batch_type` identify pure chunk batches. Intermediate
 chunks update KV state and publish only completed prefix blocks, without emitting
