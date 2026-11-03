@@ -46,7 +46,19 @@ class KVTransferConfig:
         self.kv_connector_extra_config = dict(self.kv_connector_extra_config or {})
         self.kv_connector_extra_config.setdefault("mooncake_protocol", "rdma")
 
-        allowed_extra_config_keys = frozenset({"mooncake_protocol", "num_workers"})
+        overlap = self.kv_connector_extra_config.get("chunk_transfer_overlap", False)
+        if type(overlap) is not bool:
+            raise ValueError("chunk_transfer_overlap must be a boolean")
+        if overlap and (self.kv_role != "kv_producer" or self.kv_connector != "MooncakeConnector"):
+            raise ValueError("chunk_transfer_overlap requires a Mooncake producer")
+        limit = self.kv_connector_extra_config.get("max_inflight_prefix_writes", 0)
+        if type(limit) is not int or limit < 0:
+            raise ValueError("max_inflight_prefix_writes must be a nonnegative integer")
+        if limit and not overlap:
+            raise ValueError("max_inflight_prefix_writes requires chunk_transfer_overlap")
+        allowed_extra_config_keys = frozenset({
+            "mooncake_protocol", "num_workers", "chunk_transfer_overlap", "max_inflight_prefix_writes"
+        })
         unknown_keys = (
             set(self.kv_connector_extra_config.keys()) - allowed_extra_config_keys
         )

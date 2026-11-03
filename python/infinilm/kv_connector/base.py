@@ -70,6 +70,9 @@ class KVConnectorBase(ABC):
     Base class for KV connectors.
     """
 
+    # Opt in only if the connector can retain KV across local prefill steps.
+    supports_chunked_prefill = False
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         """

@@ -34,6 +34,20 @@ class MooncakeConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
+        self._partial_sends = {}
+        self._cancel_partial = {}
+        self._streaming = set()
+
+    def publish_computed_chunk(self, request: InferenceRequest, block_size: int):
+        params = request.kv_transfer_params or {}
+        tid = params.get("transfer_id")
+        if not tid or not params.get("do_remote_decode") or request.sampling_params.max_tokens != 1:
+            return
+        # Only sealed pages from a completed forward can be read by the sender.
+        count = request.num_computed_tokens // block_size
+        total = (request.get_prompt_length() + block_size - 1) // block_size
+        self._partial_sends[tid] = (request.block_table[:count], total)
+        self._streaming.add(tid)
 
     def get_num_new_matched_tokens(
         self, request: InferenceRequest, num_computed_tokens: int
@@ -139,6 +153,8 @@ class MooncakeConnectorScheduler:
         from .mooncake_connector import MooncakeConnectorMetadata
 
         meta = MooncakeConnectorMetadata()
+        meta.partial_sends, self._partial_sends = self._partial_sends, {}
+        meta.cancel_partial, self._cancel_partial = self._cancel_partial, {}
 
         if not self.is_kv_producer:
             for req_id, (req, block_ids) in self._reqs_need_recv.items():
@@ -210,7 +226,14 @@ class MooncakeConnectorScheduler:
 
         # Producer-side error and normal handling.
         assert not self.is_kv_consumer
+        tid = params["transfer_id"]
+        streaming = tid in self._streaming
+        self._streaming.discard(tid)
         if request.status != RequestStatus.FINISHED:
+            if streaming:
+                self._partial_sends.pop(tid, None)
+                self._cancel_partial[tid] = request.request_id
+                return True, None  # Worker retires the page lease after writes stop.
             self._reqs_not_processed.add(params["transfer_id"])
             return False, None
 

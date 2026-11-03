@@ -1,3 +1,63 @@
+# ==============================
+# C / C++ / CUDA 编译产物
+# ==============================
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.ptx
+*.cubin
+*.fatbin
+
+# ==============================
+# CMake 构建产物
+# ==============================
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# ==============================
+# Python 编译产物
+# ==============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.whl
+dist/
+.eggs/
+
+# ==============================
+# Python 虚拟环境
+# ==============================
+.venv/
+venv/
+env/
+
+# ==============================
+# 缓存与临时文件
+# ==============================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.tmp
+*.log
+
+
 # Xmake cache
 .xmake/
 build/

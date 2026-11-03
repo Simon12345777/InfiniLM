@@ -37,6 +37,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[int]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.partial_sends: dict[TransferId, tuple[list[int], int]] = {}
+        self.cancel_partial: dict[TransferId, ReqId] = {}
 
     def add_new_req(
         self,
@@ -80,6 +82,9 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         self.engine_id: EngineId | None = cfg.engine_id
+        # Admission registers the transfer. Only request_finished authorizes
+        # final delivery, including when the worker has prewritten sealed pages.
+        self.supports_chunked_prefill = cfg.kv_role == "kv_producer"
 
         logger.info(
             "MooncakeConnector::__init__ kv_transfer_config=%s role=%s engine_id=%s",
@@ -132,6 +137,10 @@ class MooncakeConnector(KVConnectorBase):
     ) -> KVConnectorMetadata | None:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta()
+
+    def publish_computed_chunk(self, request: InferenceRequest, block_size: int):
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.publish_computed_chunk(request, block_size)
 
     def request_finished(
         self,

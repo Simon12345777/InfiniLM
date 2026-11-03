@@ -107,6 +107,19 @@ class LLMEngine:
         self._async_abort_owner = False
         hf_config = read_hf_config(config.model_path)
         has_mamba_cache = model_uses_mamba_cache(hf_config)
+        self._overlap_chunks = bool(
+            config.kv_transfer_config
+            and config.kv_transfer_config.kv_connector_extra_config.get("chunk_transfer_overlap")
+        )
+        if self._overlap_chunks and (
+            config.tensor_parallel_size != 1 or config.pipeline_parallel_size != 1
+            or config.enable_prefix_caching or not config.chunked_prefill_size
+            or has_mamba_cache or config.draft_model_path
+        ):
+            raise ValueError(
+                "Chunk transfer overlap requires TP=PP=1, chunked prefill, "
+                "and no prefix, recurrent or speculative cache"
+            )
         if has_mamba_cache and config.enable_prefix_caching:
             model_type = hf_config["model_type"]
             raise RuntimeError(
@@ -354,6 +367,8 @@ class LLMEngine:
                     req.num_local_cached_tokens + req.num_scheduled_tokens
                 )
                 self.scheduler.commit_computed_tokens(req, req.num_computed_tokens)
+                if self._overlap_chunks:
+                    self.scheduler.connector.publish_computed_chunk(req, self.scheduler.block_size)
                 continue
             # The model successfully consumed the request's current logical tokens.
             # Commit this boundary before observing a concurrent client abort.

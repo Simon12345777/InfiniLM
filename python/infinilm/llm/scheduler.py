@@ -239,16 +239,20 @@ class Scheduler:
         self.enable_prefix_caching = enable_prefix_caching
         # Chunked prefill: cap one request's prefill step at this many
         # tokens (block aligned). 0 disables chunking, preserving the
-        # "a single request always makes progress" behavior. Disabled
-        # with KV connectors and NSA, whose resume paths assume whole
-        # -prompt prefills.
+        # "a single request always makes progress" behavior.
         self.chunked_prefill_size = None
         if chunked_prefill_size and (
-            connector is not None or nsa_owner_pool_epoch is not None
+            nsa_owner_pool_epoch is not None
+            or (
+                connector is not None
+                and (
+                    has_mamba_cache
+                    or not getattr(connector, "supports_chunked_prefill", False)
+                )
+            )
         ):
             logger.warning(
-                "chunked_prefill_size disabled: incompatible with "
-                "KV connectors and NSA owner pools"
+                "chunked_prefill_size disabled for this KV connector or cache configuration"
             )
             chunked_prefill_size = 0
         if chunked_prefill_size:
@@ -655,6 +659,12 @@ class Scheduler:
                 req.chunked_prefill_pending = (
                     computed_start + num_scheduled < req.get_prompt_length()
                 )
+                if not req.chunked_prefill_pending:
+                    # Emit once per resumed prompt so benchmarks can verify chunking.
+                    logger.info(
+                        "Scheduling final prefill chunk for request %s at token %d",
+                        req.request_id, computed_start,
+                    )
             else:
                 load_kv_async = False
                 num_tokens_this_step = (
